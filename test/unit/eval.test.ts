@@ -47,6 +47,16 @@ test('scores keep failures and missing rows out of the decisions', () => {
   assert.deepEqual(s.jev['served models'], ['typesafe/jev-1.13-20260917'])
 })
 
+test('older public runs keep their original planned count when new cases are appended', () => {
+  const original = JSON.parse(readFileSync(join(root, 'eval', 'recorded', 'runway-2026-10-02T10-55-57-082Z.jsonl'), 'utf8').split('\n')[0]!)
+  const lines = readFileSync(join(root, 'eval', 'recorded', 'runway-2026-10-02T10-55-57-082Z.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  const run = validateRun(lines, 'older-public')
+  assert.equal(original.cases, 24)
+  assert.equal(score(run.rows, 'public', run.meta.cases).missing, 0)
+  assert.throws(() => validateRun([{ ...original, cases: 1 }, ...run.rows], 'too-many'), /planned case count/)
+  assert.throws(() => validateRun([{ ...original, cases: 0 }, ...run.rows], 'zero'), /planned case count/)
+})
+
 test('the suite and the September baseline are validated like the original eval', () => {
   assert.throws(() => validateSuite({ ...suite, revision: 3, privateCorpusSha256: 'x' }))
   const dup = JSON.parse(readFileSync(join(root, 'eval', 'cases.json'), 'utf8'))
@@ -98,4 +108,17 @@ test('public runs are validated and scored against public labels only; missing a
   assert.equal(s.gate.errors, 1)
   assert.throws(() => validateRun([pubMeta, ok(a.id, a.expected)], 'p'), /invalid row/, 'a historical id in a public run')
   assert.throws(() => validateRun([meta, ok(pa.id, 'allow')], 'h'), /invalid row/, 'a public id in a historical run')
+})
+
+test('raw reviewer answers in a row must be numbers; candidate reviewer runs are listed apart from production', () => {
+  const pubMeta: RunMetadata = { ...meta, selection: 'public', cases: suite.publicCases.length }
+  const pa = suite.publicCases.find(c => c.expected === 'allow')!
+  const withRaw = (raw: unknown) => ({ ...ok(pa.id, 'allow'), reviewer: { ...ok(pa.id, 'allow').reviewer!, raw } })
+  assert.equal(validateRun([pubMeta, withRaw({ nouls: { a: 0.1 }, scores: { risk: { score: 0.2, probabilities: { '0': 0.8 }, confidence: 0.7 } } })], 'p').rows.length, 1)
+  assert.throws(() => validateRun([pubMeta, withRaw({ nouls: { a: 'text' }, scores: {} })], 'p'), /numbers/)
+  const s = summary()
+  const latest = s.public.latest as { source: string }
+  const candidates = s.public['candidate reviewers'] as { source: string; variant: string }[]
+  assert.ok(candidates.length >= 1 && candidates.every(c => c.variant))
+  assert.ok(!candidates.some(c => c.source === latest.source), 'a candidate run is never reported as the production result')
 })

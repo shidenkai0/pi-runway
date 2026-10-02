@@ -2,11 +2,10 @@ import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { RunwayConfig, ReviewerRoute } from '../config.ts'
-import { compose, DEFAULT_THRESHOLDS } from './compose.ts'
 import type { Composition } from './compose.ts'
-import { buildSystemPrompt } from './prompt.ts'
-import { parseQuestions, QUESTION_SET } from './questions.ts'
 import { redactActionValue } from './redact.ts'
+import { parseRaw, PRODUCTION_REVIEWER } from './reviewer.ts'
+import type { RawAnswers, Reviewer } from './reviewer.ts'
 
 // Jev (TypeSafe's System One safety model). One structured request per
 // escalation: fixed safety questions come back as probabilities, and the
@@ -62,6 +61,8 @@ export interface JevVerdict {
   fired: string[]
   latencyMs: number
   model: string
+  /** Jev's answers as numbers (no text), for the evaluation. */
+  raw: RawAnswers
 }
 
 export class ReviewerError extends Error {
@@ -84,11 +85,13 @@ export interface JevDeps {
   fetchImpl?: typeof fetch
   signal?: AbortSignal
   env?: NodeJS.ProcessEnv
+  /** Questions, policy and composer; production unless the evaluation compares a candidate. */
+  reviewer?: Reviewer
 }
 
-export function buildState(request: JevRequest): Record<string, unknown> {
+export function buildState(request: JevRequest, policy: string = PRODUCTION_REVIEWER.policy): Record<string, unknown> {
   return {
-    policy: buildSystemPrompt(),
+    policy,
     transcript: request.transcript,
     action: Object.fromEntries(Object.entries(request.action).map(([k, v]) => [k, redactActionValue(v)])),
     uid: randomBytes(8).toString('hex'),
@@ -106,7 +109,8 @@ export async function askJev(
   // Test hook: point the reviewer at a local fake. Never set in normal use.
   const url = env.PI_RUNWAY_REVIEWER_URL || ROUTE_URLS[cfg.route]
   const model = cfg.route === 'openrouter' ? cfg.model : cfg.modelDirect
-  const body = JSON.stringify({ model, state: buildState(request), questions: QUESTION_SET })
+  const reviewer = deps.reviewer ?? PRODUCTION_REVIEWER
+  const body = JSON.stringify({ model, state: buildState(request, reviewer.policy), questions: reviewer.questions })
   const timeout = AbortSignal.timeout(cfg.timeoutMs)
   const signal = deps.signal ? AbortSignal.any([timeout, deps.signal]) : timeout
   const started = Date.now()
@@ -147,8 +151,10 @@ export async function askJev(
       throw new ReviewerError('bad-response', 'Jev returned a body that is not JSON')
     }
     let composition: Composition
+    let raw: RawAnswers
     try {
-      composition = compose(parseQuestions(json?.answers), DEFAULT_THRESHOLDS)
+      raw = parseRaw(json?.answers, reviewer.questions)
+      composition = reviewer.compose(raw)
     } catch (error) {
       throw new ReviewerError('bad-response', error instanceof Error ? error.message : 'unexpected Jev answer shape')
     }
@@ -160,6 +166,7 @@ export async function askJev(
       fired: Object.entries(composition.fired).filter(([, v]) => v).map(([k]) => k),
       latencyMs: Date.now() - started,
       model: typeof json.model === 'string' ? json.model : model,
+      raw,
     }
   }
 }

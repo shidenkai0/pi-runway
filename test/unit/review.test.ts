@@ -123,3 +123,47 @@ test('npm run eval reproduces the recorded baseline offline, with its denominato
   assert.equal(out.baseline['p50 ms'], 369)
   assert.equal(out.baseline['p95 ms'], 527)
 })
+
+test('answers are parsed strictly: a missing or malformed answer is a failure, never a verdict; Score confidence is kept', async () => {
+  const { parseRaw, PRODUCTION_REVIEWER } = await import('../../src/review/reviewer.ts')
+  const answers = jevAnswers({ allow: true }) as Record<string, Record<string, unknown>>
+  answers.risk = { score: 0.2, probabilities: { '0': 0.8, '1': 0.2 }, confidence: 0.6 }
+  const raw = parseRaw(answers, PRODUCTION_REVIEWER.questions)
+  assert.equal(raw.scores.risk!.confidence, 0.6)
+  assert.equal(raw.nouls.user_prohibited, 0.05)
+  const { user_prohibited: _gone, ...missing } = answers
+  assert.throws(() => parseRaw(missing, PRODUCTION_REVIEWER.questions), /user_prohibited/)
+  assert.throws(() => parseRaw({ ...answers, destructive: { noul: 'high' } }, PRODUCTION_REVIEWER.questions), /destructive/)
+  await assert.rejects(
+    askJev({ action: {}, transcript: [] }, 'k', cfg, { env: {}, fetchImpl: async () => new Response(JSON.stringify({ answers: missing }), { status: 200 }) }),
+    (e: unknown) => e instanceof ReviewerError && e.kind === 'bad-response',
+  )
+})
+
+test('the reviewer bundle reaches the wire: its questions and policy are sent, its composer decides, raw numbers come back', async () => {
+  const { PRODUCTION_REVIEWER } = await import('../../src/review/reviewer.ts')
+  let body: { questions: Record<string, unknown>; state: { policy: string } } | undefined
+  const fetchImpl = async (_u: unknown, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body))
+    return ok({ allow: true, nouls: { user_prohibited: 0.9 } })
+  }
+  const v = await askJev({ action: {}, transcript: [] }, 'k', cfg, { env: {}, fetchImpl })
+  assert.deepEqual(Object.keys(body!.questions), Object.keys(QUESTION_SET))
+  assert.equal(body!.state.policy, PRODUCTION_REVIEWER.policy)
+  assert.deepEqual([v.outcome, v.why], ['deny', 'user prohibition still in effect'])
+  assert.equal(v.raw.nouls.user_prohibited, 0.9)
+  assert.ok(Object.values(v.raw.nouls).every(n => typeof n === 'number'), 'numbers only, no text')
+  const candidate = { ...PRODUCTION_REVIEWER, name: 'probe', policy: 'short policy', questions: { only: { type: 'noul' as const } }, compose: () => ({ outcome: 'allow' as const, why: 'probe', riskLevel: 'low' as const, authorization: 'high' as const, injection: false, deferAdvised: false, fired: {} as never }) }
+  const c = await askJev({ action: {}, transcript: [] }, 'k', cfg, { env: {}, reviewer: candidate, fetchImpl: async (_u, init) => {
+    body = JSON.parse(String(init?.body))
+    return new Response(JSON.stringify({ answers: { only: { noul: 0.1 } } }), { status: 200 })
+  } })
+  assert.deepEqual(Object.keys(body!.questions), ['only'])
+  assert.equal(body!.state.policy, 'short policy')
+  assert.equal(c.why, 'probe')
+})
+
+test('production asks about restrictions by scope and reach (the evaluated wording), and the historical frozen set is untouched', () => {
+  const q = QUESTION_SET.user_prohibited.instructions
+  for (const part of ['forbid an action or a target', 'limit the work to a scope', 'exclude a place', 'walks a folder recursively', 'names specific files or folders reaches only those', 'still in effect']) assert.ok(q.includes(part), part)
+})

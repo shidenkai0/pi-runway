@@ -569,3 +569,43 @@ test('trial counters: per session, prompts only when a person saw a dialog, chil
   assert.match(lines[2]!, /Jev reviewed 4: 2 allowed, 1 said no, 1 failed · median \d+ ms/)
   assert.ok(!lines.join('\n').includes('npm'), 'no command text is kept')
 })
+
+test('gate wiring: a user restriction answer denies; a malformed answer or no key never allows', async () => {
+  const h = harness()
+  const restricted = async (session: string, hasUI: boolean) => {
+    const rt = h.rt
+    rt.sessions.set(session, { id: session, ctx: { hasUI } as never, hasUI })
+    return gate(op('bash', { command: 'grep -rn x .' }, id.runway), {
+      rt, config: DEFAULT_CONFIG, policy, mode: 'auto', sessionId: session,
+      ctx: { hasUI, mode: 'rpc', cwd: project, sessionManager: { getSessionId: () => session, getBranch: () => [] }, modelRegistry: { getApiKeyForProvider: async () => 'k' }, ui: { notify: () => {}, setStatus: () => {}, select: async () => undefined } } as never,
+      fetchImpl: async () => new Response(JSON.stringify({ model: 'jev', answers: jevAnswers({ allow: true, nouls: { user_prohibited: 0.9 } }) }), { status: 200 }),
+    })
+  }
+  const headless = await restricted('r1', false)
+  assert.equal(headless.allow, false)
+  assert.match(headless.message!, /the user said not to do this/)
+  const malformed = await gate(op('bash', { command: 'ls' }, id.runway), {
+    rt: h.rt, config: DEFAULT_CONFIG, policy, mode: 'auto', sessionId: 'r2',
+    ctx: { hasUI: false, mode: 'print', cwd: project, sessionManager: { getSessionId: () => 'r2', getBranch: () => [] }, modelRegistry: { getApiKeyForProvider: async () => 'k' }, ui: { notify: () => {}, setStatus: () => {} } } as never,
+    fetchImpl: async () => new Response(JSON.stringify({ answers: { risk: { score: 0, probabilities: {} } } }), { status: 200 }),
+  })
+  assert.equal(malformed.allow, false)
+  assert.match(malformed.message!, /could not decide/)
+  // No key anywhere (and a fetch that fails the test if it is ever called).
+  const saved = { or: process.env.OPENROUTER_API_KEY, ts: process.env.TYPESAFE_API_KEY }
+  delete process.env.OPENROUTER_API_KEY
+  delete process.env.TYPESAFE_API_KEY
+  h.rt.agentDir = join(root, 'no-agent-dir')
+  try {
+    const noKey = await gate(op('bash', { command: 'ls' }, id.runway), {
+      rt: h.rt, config: DEFAULT_CONFIG, policy, mode: 'auto', sessionId: 'r3',
+      ctx: { hasUI: false, mode: 'print', cwd: project, sessionManager: { getSessionId: () => 'r3', getBranch: () => [] }, modelRegistry: {}, ui: { notify: () => {}, setStatus: () => {} } } as never,
+      fetchImpl: async () => assert.fail('no reviewer call without a key'),
+    })
+    assert.equal(noKey.allow, false)
+    assert.match(noKey.message!, /no reviewer key/)
+  } finally {
+    if (saved.or !== undefined) process.env.OPENROUTER_API_KEY = saved.or
+    if (saved.ts !== undefined) process.env.TYPESAFE_API_KEY = saved.ts
+  }
+})

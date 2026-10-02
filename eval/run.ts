@@ -37,7 +37,9 @@ import type { Operation, ToolIdentity } from '../src/permissions/operation.ts'
 import { buildPolicy } from '../src/policy.ts'
 import { DEFAULT_THRESHOLDS } from '../src/review/compose.ts'
 import { resolveReviewerKey } from '../src/review/jev.ts'
-import { QUESTION_SET } from '../src/review/questions.ts'
+import { PRODUCTION_REVIEWER } from '../src/review/reviewer.ts'
+import type { RawAnswers, Reviewer } from '../src/review/reviewer.ts'
+import { VARIANTS } from './variants.ts'
 import { Runtime } from '../src/runtime.ts'
 
 type Label = 'allow' | 'deny'
@@ -59,7 +61,7 @@ interface Suite { revision: number; privateCorpusSha256: string; policyBasis: st
 export type Selection = 'historical' | 'public'
 
 type ReviewerResult =
-  | { status: 'OK'; outcome: Label; why: string; risk: string; authorization: string; fired: string[]; latencyMs: number; model: string }
+  | { status: 'OK'; outcome: Label; why: string; risk: string; authorization: string; fired: string[]; latencyMs: number; model: string; raw?: RawAnswers }
   | { status: 'ERROR'; failure: string; latencyMs: number }
 
 /** One decision. `gate` is what Runway did; `reviewer` is Jev's answer when the gate asked it. */
@@ -77,6 +79,8 @@ export interface RunMetadata {
   type: 'metadata'
   /** Which cases the run covers; absent in runs from before public cases existed (historical). */
   selection?: Selection
+  /** A candidate reviewer from eval/variants.ts; absent for production. */
+  variant?: string
   fingerprint: string
   parts: Record<string, string>
   model: string
@@ -181,6 +185,8 @@ export function validateRun(rows: unknown[], file: string): { meta: RunMetadata;
   const [first, ...rest] = rows as [RunMetadata, ...Row[]]
   if (first?.type !== 'metadata' || !HEX64.test(first.fingerprint) || typeof first.parts !== 'object' || first.repeats !== 3 || (first.selection !== undefined && first.selection !== 'historical' && first.selection !== 'public')) throw new Error(`${file}: missing or malformed metadata line`)
   const selection = selectionOf(first)
+  if (!Number.isInteger(first.cases) || first.cases <= 0 || first.cases > labelsOf(selection).size || rest.length > first.cases * first.repeats) throw new Error(`${file}: invalid planned case count`)
+  if (new Set(rest.map(r => r?.caseId)).size > first.cases) throw new Error(`${file}: more cases than the run planned`)
   if (selection === 'historical' && first.cases !== suite.cases.length) throw new Error(`${file}: covers ${first.cases} historical cases, the suite has ${suite.cases.length}`)
   for (const r of rest) {
     const where = `${file}: ${r?.caseId}#${r?.repeat}`
@@ -190,29 +196,45 @@ export function validateRun(rows: unknown[], file: string): { meta: RunMetadata;
     if ((r.settledBy === 'reviewer') !== (v?.status === 'OK') || (r.settledBy === 'reviewer-failed') !== (v?.status === 'ERROR')) throw new Error(`${where}: reviewer and settlement disagree`)
     if (v && (!Number.isFinite(v.latencyMs) || v.latencyMs < 0)) throw new Error(`${where}: bad latency`)
     if (v?.status === 'OK' && (!LABELS.includes(v.outcome) || typeof v.model !== 'string' || !v.model || !Array.isArray(v.fired))) throw new Error(`${where}: bad reviewer answer`)
+    if (v?.status === 'OK' && v.raw && ![...Object.values(v.raw.nouls), ...Object.values(v.raw.scores).flatMap(sc => [sc.score, ...Object.values(sc.probabilities), ...(sc.confidence === undefined ? [] : [sc.confidence])])].every(Number.isFinite)) throw new Error(`${where}: raw answers must be numbers`)
     if (r.settledBy === 'reviewer-failed' && r.gate !== 'error') throw new Error(`${where}: a failed review counted as a decision`)
   }
   validTuples(rest, labelsOf(selection), file)
   return { meta: first, rows: rest }
 }
 
+function runMeta(f: string): RunMetadata {
+  return JSON.parse(readFileSync(join(here, 'recorded', f), 'utf8').split('\n')[0]!) as RunMetadata
+}
+
+/** Production runs of one selection (candidate-reviewer runs are listed apart). */
 function runFiles(selection: Selection): string[] {
-  const dir = join(here, 'recorded')
-  return readdirSync(dir).filter(f => /^runway-.*\.jsonl$/.test(f)).sort().filter(f => selectionOf(JSON.parse(readFileSync(join(dir, f), 'utf8').split('\n')[0]!) as RunMetadata) === selection)
+  return readdirSync(join(here, 'recorded')).filter(f => /^runway-.*\.jsonl$/.test(f)).sort().filter(f => selectionOf(runMeta(f)) === selection && !runMeta(f).variant)
+}
+
+/** Candidate-reviewer runs (public cases), each scored on its own. */
+function variantRuns() {
+  return readdirSync(join(here, 'recorded')).filter(f => /^runway-.*\.jsonl$/.test(f)).sort().filter(f => runMeta(f).variant).map(f => {
+    const run = validateRun(readJsonl(join(here, 'recorded', f)), f)
+    const s = score(run.rows, 'public', run.meta.cases)
+    return { source: `eval/recorded/${f}`, variant: run.meta.variant, gate: s.gate, 'jev p50/p95 ms': [s.jev['p50 ms'], s.jev['p95 ms']], missing: s.missing, ...publicDetail(run.rows) }
+  })
 }
 
 // ---------- fingerprint ----------
 
 const FINGERPRINTED_SOURCES = [
-  'src/review/questions.ts', 'src/review/compose.ts', 'src/review/prompt.ts', 'src/review/jev.ts', 'src/review/redact.ts',
+  'src/review/questions.ts', 'src/review/compose.ts', 'src/review/prompt.ts', 'src/review/jev.ts', 'src/review/redact.ts', 'src/review/reviewer.ts',
   'src/permissions/gate.ts', 'src/permissions/rules.ts', 'src/permissions/operation.ts', 'src/permissions/shell.ts', 'src/policy.ts',
-  'eval/run.ts',
+  'eval/run.ts', 'eval/variants.ts',
 ]
 
 /** What a run's results depend on: questions, policy prompt, composer, gate and its projection, reviewer config, labels, inputs. */
-export function fingerprintParts(config: RunwayConfig, inputs: Record<string, string>, selection: Selection = 'historical'): Record<string, string> {
+export function fingerprintParts(config: RunwayConfig, inputs: Record<string, string>, selection: Selection = 'historical', reviewer: Reviewer = PRODUCTION_REVIEWER): Record<string, string> {
   return {
-    questions: sha256(JSON.stringify(QUESTION_SET)),
+    // A candidate reviewer (eval/variants.ts) is recorded by its questions, policy text and composer.
+    ...(reviewer === PRODUCTION_REVIEWER ? {} : { variant: sha256(JSON.stringify({ name: reviewer.name, questions: reviewer.questions, policy: reviewer.policy, compose: reviewer.compose.toString() })) }),
+    questions: sha256(JSON.stringify(PRODUCTION_REVIEWER.questions)),
     thresholds: sha256(JSON.stringify(DEFAULT_THRESHOLDS)),
     reviewer: sha256(JSON.stringify(config.reviewer)),
     gateConfig: sha256(JSON.stringify({ ...config, reviewer: undefined })),
@@ -298,7 +320,7 @@ export function prepare(prompt: Prompt, workspace: string): Prepared {
 
 // ---------- deciding ----------
 
-async function decide(p: Prepared, repeat: number, key: string, scratch: string, config: RunwayConfig, fingerprint: string): Promise<Row> {
+async function decide(p: Prepared, repeat: number, key: string, scratch: string, config: RunwayConfig, fingerprint: string, reviewerDef: Reviewer = PRODUCTION_REVIEWER): Promise<Row> {
   const rt = new Runtime(SandboxManager)
   rt.agentDir = scratch // decision log goes to scratch, never to your Pi folder
   const sessionId = `eval-${p.id}-${repeat}`
@@ -314,11 +336,11 @@ async function decide(p: Prepared, repeat: number, key: string, scratch: string,
     ui: { notify: () => {}, setStatus: () => {} },
   } as never
   const verdict = await gate(p.op, {
-    rt, config, policy: buildPolicy(p.op.cwd, config, scratch), mode: 'auto', ctx, sessionId,
+    rt, config, policy: buildPolicy(p.op.cwd, config, scratch), mode: 'auto', ctx, sessionId, reviewer: reviewerDef,
     replay: { transcript: p.transcript, recordedRequest: p.recordedRequest, notRecorded: p.notRecorded, cwd: p.cwd },
     onReview: result => {
       reviewer = 'verdict' in result
-        ? { status: 'OK', outcome: result.verdict.outcome, why: result.verdict.why, risk: result.verdict.risk, authorization: result.verdict.authorization, fired: result.verdict.fired, latencyMs: result.verdict.latencyMs, model: result.verdict.model }
+        ? { status: 'OK', outcome: result.verdict.outcome, why: result.verdict.why, risk: result.verdict.risk, authorization: result.verdict.authorization, fired: result.verdict.fired, latencyMs: result.verdict.latencyMs, model: result.verdict.model, raw: result.verdict.raw }
         : { status: 'ERROR', failure: result.failure, latencyMs: result.latencyMs }
     },
   })
@@ -331,8 +353,8 @@ async function decide(p: Prepared, repeat: number, key: string, scratch: string,
 
 const pct = (xs: number[], p: number) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.max(0, Math.ceil(xs.length * p) - 1)]! : null)
 
-export function score(rows: Row[], selection: Selection = 'historical') {
-  const planned = labelsOf(selection).size * 3
+export function score(rows: Row[], selection: Selection = 'historical', caseCount = labelsOf(selection).size) {
+  const planned = caseCount * 3
   const reviewed = rows.filter(r => r.reviewer)
   const ok = reviewed.filter(r => r.reviewer!.status === 'OK') as (Row & { reviewer: Extract<ReviewerResult, { status: 'OK' }> })[]
   const decided = rows.filter(r => r.gate !== 'error')
@@ -413,15 +435,16 @@ export function summary() {
     suite: count(suite.cases),
     baseline: { source: 'eval/recorded/jev-2026-09-22.jsonl: Jev alone, earlier setup', ...baselineScore() },
     runway: historical.run
-      ? { source: `eval/recorded/${historical.latest}`, fingerprint: historical.run.meta.fingerprint, 'changed since this run': changed(historical.changed), ...score(historical.run.rows, 'historical') }
+      ? { source: `eval/recorded/${historical.latest}`, fingerprint: historical.run.meta.fingerprint, 'changed since this run': changed(historical.changed), ...score(historical.run.rows, 'historical', historical.run.meta.cases) }
       : undefined,
     'earlier runs': historical.files.slice(0, -1),
     public: {
       suite: `${count(publicCases)}; synthetic, inputs in eval/cases.json; scored apart from the historical cases`,
       latest: pub.run
-        ? { source: `eval/recorded/${pub.latest}`, fingerprint: pub.run.meta.fingerprint, 'changed since this run': changed(pub.changed), ...score(pub.run.rows, 'public'), ...publicDetail(pub.run.rows) }
+        ? { source: `eval/recorded/${pub.latest}`, fingerprint: pub.run.meta.fingerprint, 'changed since this run': changed(pub.changed), ...score(pub.run.rows, 'public', pub.run.meta.cases), ...publicDetail(pub.run.rows) }
         : 'not run yet: npm run eval -- --live --cases public',
       'earlier runs': pub.files.slice(0, -1),
+      'candidate reviewers': variantRuns(),
     },
   }
 }
@@ -429,13 +452,14 @@ export function summary() {
 // ---------- main ----------
 
 function parseArgs(argv: string[]) {
-  const out = { live: false, dryRun: false, help: false, inputs: undefined as string | undefined, cases: 'historical' as Selection }
+  const out = { live: false, dryRun: false, help: false, inputs: undefined as string | undefined, cases: 'historical' as Selection, variant: undefined as string | undefined }
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]
     if (a === '--live') out.live = true
     else if (a === '--dry-run') out.dryRun = true
     else if (a === '--help') out.help = true
     else if (a === '--inputs') out.inputs = argv[++i]
+    else if (a === '--variant' && argv[i + 1] && argv[i + 1]! in VARIANTS) out.variant = argv[++i]
     else if (a === '--cases' && (argv[i + 1] === 'historical' || argv[i + 1] === 'public')) out.cases = argv[++i] as Selection
     else throw new Error(`unknown argument ${a}; see npm run eval -- --help`)
   }
@@ -467,7 +491,9 @@ async function main() {
       for (const k of Object.keys(p.recordedRequest ?? {})) acc[k] = (acc[k] ?? 0) + 1
       return acc
     }, {})
-    const parts = fingerprintParts(config, hashes, opts.cases)
+    const reviewerDef = opts.variant ? VARIANTS[opts.variant]! : PRODUCTION_REVIEWER
+    if (opts.variant && opts.cases !== 'public') throw new Error('candidate reviewers are compared on the public cases only; nothing was sent')
+    const parts = fingerprintParts(config, hashes, opts.cases, reviewerDef)
     const fingerprint = sha256(JSON.stringify(parts))
     if (opts.dryRun) {
       console.log(`Converted ${prepared.length} cases into Runway calls (${Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ')}); recorded fields kept as evidence: ${JSON.stringify(evidence)}; fingerprint ${fingerprint.slice(0, 12)}; ${prepared.length * 3} decisions planned. No network, nothing written.`)
@@ -477,13 +503,13 @@ async function main() {
     if (!key) throw new Error('no reviewer key (OPENROUTER_API_KEY or Pi login); nothing was sent')
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
     const out = join(here, 'recorded', `runway-${stamp}.jsonl`)
-    const meta: RunMetadata = { type: 'metadata', selection: opts.cases, fingerprint, parts, model: config.reviewer.model, repeats: 3, cases: prepared.length, started: new Date().toISOString() }
+    const meta: RunMetadata = { type: 'metadata', selection: opts.cases, ...(opts.variant ? { variant: opts.variant } : {}), fingerprint, parts, model: config.reviewer.model, repeats: 3, cases: prepared.length, started: new Date().toISOString() }
     writeFileSync(out, `${JSON.stringify(meta)}\n`, { flag: 'wx' })
     console.log(`Live: ${prepared.length} ${opts.cases} cases × 3 through Runway's gate${opts.cases === 'historical' ? '; private evidence goes to Jev only' : ''}. Outcome-only rows: ${out}`)
     let done = 0
     for (let repeat = 0; repeat < 3; repeat += 1) {
       for (const p of prepared) {
-        appendFileSync(out, `${JSON.stringify(await decide(p, repeat, key, scratch, config, fingerprint))}\n`)
+        appendFileSync(out, `${JSON.stringify(await decide(p, repeat, key, scratch, config, fingerprint, reviewerDef))}\n`)
         done += 1
         if (done % 49 === 0) console.log(`${done}/${prepared.length * 3}`)
       }

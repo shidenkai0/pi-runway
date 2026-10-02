@@ -16,6 +16,7 @@ import type { Operation } from './operation.ts'
 import { allowedPartByPart, defaultRules, describeRule, ruleMatches, strongestMatch, uncertainRestrictive } from './rules.ts'
 import type { Rule } from './rules.ts'
 import { saveScopes, sessionOpLabel } from './suggest.ts'
+import type { Reviewer } from '../review/reviewer.ts'
 
 // The one decision every tool call goes through.
 //
@@ -53,6 +54,8 @@ export interface GateContext {
    * evidence and what was never recorded; for a public case its working folder.
    */
   replay?: { transcript: object[]; recordedRequest?: Record<string, unknown>; notRecorded: string[]; cwd?: string }
+  /** The evaluation's candidate reviewer (questions, policy, composer); production otherwise. */
+  reviewer?: Reviewer
   /** Told every reviewer answer or failure, as structured data (eval/run.ts records them). */
   onReview?: (result: { verdict: JevVerdict } | { failure: string; latencyMs: number }) => void
 }
@@ -300,7 +303,7 @@ async function review(op: Operation, g: GateContext, why: string): Promise<Verdi
   const started = Date.now()
   try {
     const transcript = g.replay?.transcript ?? renderTranscriptForState(g.ctx.sessionManager.getBranch() as never).entries
-    verdict = await askJev({ action: reviewerAction(op, g), transcript }, key, config.reviewer, { fetchImpl: g.fetchImpl, signal: g.signal })
+    verdict = await askJev({ action: reviewerAction(op, g), transcript }, key, config.reviewer, { fetchImpl: g.fetchImpl, signal: g.signal, reviewer: g.reviewer })
     rt.breaker.recordSuccess()
     g.onReview?.({ verdict })
     const t = rt.tally.for(g.sessionId)
