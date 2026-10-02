@@ -1,0 +1,13 @@
+pi-runway — MIT License. Copyright (c) 2026 the pi-runway authors.
+
+The Jev reviewer (src/review/, eval/) is carried over from pi-auto-review-jev
+(MIT, Copyright (c) 2026 the pi-auto-review-jev authors), which in turn
+includes portions of @mzwing/pi-permission-auto-review (MIT,
+https://github.com/mzwing/pi-packages): transcript rendering and redaction.
+
+The reviewer policy text (src/review/prompt.ts) is adapted from OpenAI Codex's
+Guardian policy (Apache-2.0), https://github.com/openai/codex, commit
+c4f42d161ae44a8d696ee9fb595709661979d187.
+
+Sandboxing is provided by @anthropic-ai/sandbox-runtime (Apache-2.0),
+https://github.com/anthropics/sandbox-runtime.

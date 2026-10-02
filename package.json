@@ -1,0 +1,53 @@
+{
+  "name": "pi-runway",
+  "version": "0.1.0",
+  "description": "Let Pi work on its own, safely: a sandbox for everyday work and a fast reviewer for anything that leaves it.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "sandbox",
+    "auto-review",
+    "autonomy",
+    "jev"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "docs",
+    "LICENSE",
+    "NOTICE",
+    "scripts/try-local.sh",
+    "scripts/try-local.mjs"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=4 test/unit/*.test.ts",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.ts",
+    "e2e:deps": "mkdir -p .e2e/deps && cd .e2e/deps && (test -f package.json || echo '{\"private\":true}' > package.json) && npm install --no-audit --no-fund @gotgenes/pi-subagents@latest",
+    "test:matrix": "node test/matrix/run.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.77"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}
