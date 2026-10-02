@@ -1,7 +1,7 @@
 {
   "name": "pi-runway",
   "version": "0.1.0",
-  "description": "Let Pi work on its own, safely: a sandbox for everyday work and a fast reviewer for anything that leaves it.",
+  "description": "Autonomous coding in Pi with mistakes contained: an OS sandbox for every command, one permission gate for every tool call, Jev review for anything your rules don't decide \u2014 plus subagents, plan mode and web tools in one install.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -28,26 +28,37 @@
     ]
   },
   "engines": {
-    "node": ">=20.6"
+    "node": ">=22.19"
   },
   "scripts": {
     "test": "node --test --test-concurrency=4 test/unit/*.test.ts",
+    "eval": "node eval/run.ts",
     "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.ts",
     "e2e:deps": "mkdir -p .e2e/deps && cd .e2e/deps && (test -f package.json || echo '{\"private\":true}' > package.json) && npm install --no-audit --no-fund @gotgenes/pi-subagents@latest",
     "test:matrix": "node test/matrix/run.ts",
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "0.0.77"
+    "@anthropic-ai/sandbox-runtime": "0.0.77",
+    "@gotgenes/pi-subagents": "21.9.1",
+    "@narumitw/pi-plan-mode": "0.58.4",
+    "pi-web-access": "0.35.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
     "@types/node": "^24.10.1",
-    "typescript": "^5.9.3"
-  }
+    "typescript": "^5.9.3",
+    "@earendil-works/pi-tui": "1.0.0"
+  },
+  "bundleDependencies": [
+    "@gotgenes/pi-subagents",
+    "@narumitw/pi-plan-mode",
+    "pi-web-access"
+  ]
 }

@@ -3,6 +3,7 @@ import { existsSync, lstatSync, readlinkSync, realpathSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { RunwayConfig } from './config.ts'
+import { nestedControlPaths } from './linux.ts'
 
 // The containment policy, as plain data. One function turns (cwd, config) into
 // the sandbox rules for a command; the same rules decide whether Pi's own
@@ -283,6 +284,13 @@ export function buildPolicy(cwd: string, config: RunwayConfig, agentDir: string)
   for (const p of controlPaths(workspace, realCwd, agentDir, git)) {
     if (!existsSync(dirname(p))) continue
     for (const s of spellings(p)) denyWrite.add(s)
+  }
+  // bubblewrap can't take `**` globs (sandbox-runtime drops them): list what exists.
+  if (!broad && process.platform === 'linux') {
+    for (const p of nestedControlPaths(workspace)) {
+      denyWrite.add(p)
+      protectedPaths.add(p)
+    }
   }
   // sandbox-runtime blocks these only beneath the folder Pi was started in; cover
   // the actual project too (it differs after /worktree or in a subagent's worktree).

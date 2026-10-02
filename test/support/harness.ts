@@ -9,8 +9,15 @@ import { join, resolve } from 'node:path'
 // No real credentials, no paid calls.
 
 export const PACKAGE_ROOT = resolve(import.meta.dirname, '..', '..')
+/** The Pi under test: the package's own dev dependency (Pi 1.x), never the global install. Override with PI_BIN. */
+export const PI_BIN = process.env.PI_BIN || join(PACKAGE_ROOT, 'node_modules', '.bin', 'pi')
 export const SECRET_CANARY = 'CANARY-SECRET-7f3a91'
 export const ENV_CANARY = 'CANARY-ENV-4b2c88'
+/**
+ * How a sandboxed read of a credential path fails: Seatbelt refuses it
+ * ("Operation not permitted"); bubblewrap hides it, so it doesn't exist.
+ */
+export const READ_BLOCKED = process.platform === 'linux' ? /No such file or directory|Permission denied|Operation not permitted/ : /Operation not permitted/
 
 export type Reply = { text: string } | { tool: string; args: Record<string, unknown> } | { tools: { tool: string; args: Record<string, unknown> }[] }
 
@@ -43,6 +50,7 @@ export function jevAnswers(spec: JevAnswerSpec): Record<string, unknown> {
     credential_probing: 0.05,
     security_weakening: 0.05,
     discloses_secret_to_context: 0.05,
+    user_prohibited: 0.05,
     untrusted_instructed: 0.05,
     task_related: 0.95,
     narrowly_scoped: 0.9,
@@ -147,6 +155,7 @@ export interface Home {
   agentDir: string
   project: string
   env: NodeJS.ProcessEnv
+  piArgs: string[]
   cleanup(): void
 }
 
@@ -156,6 +165,8 @@ export interface HomeOptions {
   extraPackages?: string[]
   models?: string[]
   git?: boolean
+  /** Extra Pi command-line arguments, e.g. ['--tools', 'read,bash,grep']. */
+  piArgs?: string[]
 }
 
 export function makeHome(server: FakeServer, options: HomeOptions = {}): Home {
@@ -214,7 +225,7 @@ export function makeHome(server: FakeServer, options: HomeOptions = {}): Home {
     PI_RUNWAY_REVIEWER_URL: `${server.url}/api/alpha/decisions`,
   }
   if (options.reviewerKey !== false) env.OPENROUTER_API_KEY = 'sk-or-fake-reviewer-key-000000000000'
-  return { root, home, agentDir, project, env, cleanup: () => rmSync(root, { recursive: true, force: true }) }
+  return { root, home, agentDir, project, env, piArgs: options.piArgs ?? [], cleanup: () => rmSync(root, { recursive: true, force: true }) }
 }
 
 export interface PiEvent {
@@ -239,8 +250,11 @@ function textOf(result: unknown): string {
 export type UiHandler = (req: PiEvent) => Record<string, unknown> | undefined
 
 /** Drive `pi --mode rpc`: send prompts, answer dialogs, collect events until Pi settles. */
-export async function runRpc(h: Home, prompts: string[], onUi: UiHandler = () => ({ cancelled: true }), timeoutMs = 60_000): Promise<RunResult> {
-  const child = spawn('pi', ['--mode', 'rpc'], { cwd: h.project, env: h.env, stdio: ['pipe', 'pipe', 'pipe'] })
+/** A prompt, a slash command, or a raw RPC command such as { type: 'new_session' }. */
+export type RpcStep = string | { rpc: Record<string, unknown> } | ((events: PiEvent[]) => string | { rpc: Record<string, unknown> })
+
+export async function runRpc(h: Home, prompts: RpcStep[], onUi: UiHandler = () => ({ cancelled: true }), timeoutMs = 60_000): Promise<RunResult> {
+  const child = spawn(PI_BIN, [...h.piArgs, '--mode', 'rpc'], { cwd: h.project, env: h.env, stdio: ['pipe', 'pipe', 'pipe'] })
   const events: PiEvent[] = []
   const uiRequests: PiEvent[] = []
   let stderr = ''
@@ -275,7 +289,7 @@ export async function runRpc(h: Home, prompts: string[], onUi: UiHandler = () =>
         resolveSettled?.()
       }
       // Slash commands answer the prompt without starting an agent run.
-      if (event.type === 'response' && event.command === 'prompt' && event.success !== false && String(event.id ?? '').startsWith('cmd')) {
+      if (event.type === 'response' && event.success !== false && String(event.id ?? '').startsWith('cmd')) {
         settledCount += 1
         resolveSettled?.()
       }
@@ -295,8 +309,16 @@ export async function runRpc(h: Home, prompts: string[], onUi: UiHandler = () =>
     })
   try {
     for (let i = 0; i < prompts.length; i += 1) {
-      const isCommand = prompts[i]!.startsWith('/')
-      send({ id: `${isCommand ? 'cmd' : 'p'}${i}`, type: 'prompt', message: prompts[i] })
+      const raw = prompts[i]!
+      const step = typeof raw === 'function' ? raw(events) : raw
+      if (typeof step !== 'string') {
+        send({ id: `cmd${i}`, ...step.rpc })
+        await waitSettled(i + 1)
+        await new Promise(r => setTimeout(r, 300))
+        continue
+      }
+      const isCommand = step.startsWith('/')
+      send({ id: `${isCommand ? 'cmd' : 'p'}${i}`, type: 'prompt', message: step })
       await waitSettled(i + 1)
       // Give fire-and-forget UI (notify) from a command a moment to arrive.
       if (isCommand) await new Promise(r => setTimeout(r, 300))
@@ -314,7 +336,7 @@ export async function runRpc(h: Home, prompts: string[], onUi: UiHandler = () =>
 
 /** Headless: `pi -p`, no UI at all. */
 export async function runPrint(h: Home, prompt: string, timeoutMs = 60_000): Promise<{ stdout: string; stderr: string; exitCode: number | null; events: PiEvent[]; toolResults: RunResult['toolResults'] }> {
-  const child = spawn('pi', ['-p', '--mode', 'json', prompt], { cwd: h.project, env: h.env, stdio: ['ignore', 'pipe', 'pipe'] })
+  const child = spawn(PI_BIN, [...h.piArgs, '-p', '--mode', 'json', prompt], { cwd: h.project, env: h.env, stdio: ['ignore', 'pipe', 'pipe'] })
   let stdout = ''
   let stderr = ''
   child.stdout.on('data', d => (stdout += d))

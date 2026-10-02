@@ -1,50 +1,54 @@
+import { fileURLToPath } from 'node:url'
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent'
 import { createBashToolDefinition, getAgentDir } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
-import { dirname } from 'node:path'
 import { directOperations, sandboxedOperations } from './bash.ts'
+import { COMPANIONS, installedPackageNames, listedPackages, loadCompanions, verifyCompanions } from './companions.ts'
+import type { CompanionId, CompanionStatus } from './companions.ts'
 import { loadConfig } from './config.ts'
 import type { Mode, RunwayConfig } from './config.ts'
-import { decide } from './escalate.ts'
-import type { Decision, Escalation } from './escalate.ts'
-import { checkFloor, OUTWARD_RULE_IDS } from './floor.ts'
-import { buildPolicy, checkRead, checkSearchRoot, checkWrite, isBroadRoot, isWithin, resolveToolPath } from './policy.ts'
+import { gate } from './permissions/gate.ts'
+import type { Verdict } from './permissions/gate.ts'
+import { networkOperation, normalize, parseHostPort } from './permissions/operation.ts'
+import type { Endpoint, Operation, ToolIdentity, ToolMeta } from './permissions/operation.ts'
+import { buildPolicy } from './policy.ts'
 import type { Policy } from './policy.ts'
 import { resolveReviewerKey } from './review/jev.ts'
 import { runtime } from './runtime.ts'
 import type { Runtime } from './runtime.ts'
-import { registerUi, refreshStatus } from './ui.ts'
+import { refreshStatus, registerUi } from './ui/commands.ts'
+import { backgroundVerdict, connectionVerdict } from './network.ts'
+import { GUARDED_SEARCH_TOOLS, guardedSearchTools } from './search.ts'
 import { registerWorktree } from './worktree.ts'
 
-// Runway: let Pi work on its own, safely.
+// Runway: autonomous coding in Pi, with mistakes contained.
 //
-//  * Commands run in a sandbox: the project (and scratch/cache folders) are
-//    writable, credential stores are unreadable, secrets are scrubbed from the
-//    environment, and only known package/code hosts are reachable.
-//  * Anything that needs to leave the sandbox is an escalation: a fixed
-//    always-ask floor goes to a person; everything else is reviewed by Jev
-//    in about half a second (auto mode) or by a person (ask mode).
+//  * Every tool call — built-in, bash, web, MCP, another extension's tool, a
+//    call made from a codemode script or by a subagent — goes through one
+//    permission gate (permissions/gate.ts): your rules and session approvals
+//    first, everything undecided to the reviewer (Jev), you as the fallback.
+//  * Independently of that decision, commands run in an OS sandbox: the
+//    project is writable, credential stores are not readable, secrets are
+//    removed from the environment, and only known hosts are reachable.
+//  * Subagents, plan mode and web tools come bundled (companions.ts).
 
 interface SessionState {
   config: RunwayConfig
+  problems: string[]
+  generation: number
 }
 
-const sessionState = new Map<string, SessionState>()
+const PI_CORE_TOOLS = new Set(['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'powershell'])
+const SELF = (() => {
+  try {
+    return fileURLToPath(import.meta.url)
+  } catch {
+    return ''
+  }
+})()
 
 export function effectiveMode(rt: Runtime, config: RunwayConfig): Mode {
-  return rt.modeOverride ?? config.mode ?? (rt.reviewerKeyPresent ? 'auto' : 'ask')
-}
-
-function sessionIdOf(ctx: ExtensionContext): string {
-  return ctx.sessionManager.getSessionId()
-}
-
-function configFor(ctx: ExtensionContext): RunwayConfig {
-  const existing = sessionState.get(sessionIdOf(ctx))
-  if (existing) return existing.config
-  const loaded = loadConfig(ctx.cwd, { projectTrusted: safeTrusted(ctx) })
-  sessionState.set(sessionIdOf(ctx), { config: loaded.config })
-  return loaded.config
+  return rt.modeOverride ?? config.mode ?? 'auto'
 }
 
 function safeTrusted(ctx: ExtensionContext): boolean {
@@ -55,89 +59,140 @@ function safeTrusted(ctx: ExtensionContext): boolean {
   }
 }
 
-export default function runway(pi: ExtensionAPI): void {
+/**
+ * Freeze approved arguments so a later handler can't change what runs (Pi
+ * keeps this same object). Already-frozen objects are still walked: a frozen
+ * root can hold a mutable nested object.
+ */
+export function deepFreeze(value: unknown, seen = new WeakSet<object>()): void {
+  if (!value || typeof value !== 'object' || seen.has(value)) return
+  seen.add(value)
+  Object.freeze(value)
+  for (const v of Object.values(value as Record<string, unknown>)) deepFreeze(v, seen)
+}
+
+/** Where an allowed call may connect: requested hosts always, hosts named in the command only if whoever allowed it saw it. */
+function approvedEndpoints(op: Operation, verdict: Verdict): Endpoint[] {
+  if (verdict.sawCall) return op.endpoints
+  return (op.access?.hosts ?? []).map(parseHostPort)
+}
+
+export default async function runway(pi: ExtensionAPI): Promise<void> {
   const rt = runtime()
+  rt.agentDir = getAgentDir()
+  const sessionState = new Map<string, SessionState>()
+  const companionOwners = new Map<string, CompanionId>()
+  let companions: CompanionStatus[] = []
+
+  const configFor = (ctx: ExtensionContext): { config: RunwayConfig; problems: string[] } => {
+    const id = ctx.sessionManager.getSessionId()
+    const cached = sessionState.get(id)
+    if (cached && cached.generation === rt.configGeneration) return cached
+    const loaded = loadConfig(ctx.cwd, { projectTrusted: safeTrusted(ctx) })
+    const state = { config: loaded.config, problems: loaded.problems, generation: rt.configGeneration }
+    sessionState.set(id, state)
+    return state
+  }
+
   const policyCache = new Map<string, { at: number; policy: Policy }>()
   const policyFor = (cwd: string, config: RunwayConfig): Policy => {
     const cached = policyCache.get(cwd)
     if (cached && Date.now() - cached.at < 5_000) return cached.policy
-    const policy = buildPolicy(cwd, config, rt.agentDir || getAgentDir())
+    const policy = buildPolicy(cwd, config, rt.agentDir)
     policyCache.set(cwd, { at: Date.now(), policy })
     return policy
   }
 
-  const decideFor = (ctx: ExtensionContext, e: Escalation, signal?: AbortSignal): Promise<Decision> => {
-    const config = configFor(ctx)
-    return decide({ rt, config, mode: effectiveMode(rt, config), ctx, sessionId: sessionIdOf(ctx), signal }, e)
+  // ---------- companions (before our gate, so e.g. plan mode can refuse edits first) ----------
+
+  {
+    const startup = loadConfig(process.cwd(), { projectTrusted: false })
+    companions = await loadCompanions(pi, startup.config, installedPackageNames(rt.agentDir, process.cwd()), companionOwners)
+    rt.companions = companions
   }
 
-  // ---------- sessions ----------
+  // ---------- tool identity: from Pi's registry, never from a name alone ----------
 
-  pi.on('session_start', async (_event, ctx) => {
-    rt.agentDir = getAgentDir()
-    const loaded = loadConfig(ctx.cwd, { projectTrusted: safeTrusted(ctx) })
-    sessionState.set(sessionIdOf(ctx), { config: loaded.config })
-    rt.config = loaded.config
-    rt.configProblems = loaded.problems
-    rt.sessions.set(sessionIdOf(ctx), { id: sessionIdOf(ctx), ctx, hasUI: ctx.hasUI })
-    rt.sessionsStarted = true
-    rt.reviewerKeyPresent = Boolean(await resolveReviewerKey(loaded.config.reviewer.route, ctx.modelRegistry ?? {}, process.env, rt.agentDir))
-    const mode = effectiveMode(rt, loaded.config)
-    rt.lastMode = mode
-    if (mode !== 'off') await rt.ensureSandbox(loaded.config, policyFor(ctx.cwd, loaded.config))
-    if (ctx.hasUI) {
-      for (const problem of loaded.problems) ctx.ui.notify(`Runway settings: ${problem}`, 'warning')
-      if (mode !== 'off' && rt.sandboxState !== 'ready') {
-        ctx.ui.notify(`Runway: ${rt.sandboxError ?? 'the sandbox did not start'}. Every command will be reviewed instead.`, 'warning')
-      }
-      refreshStatus(ctx, rt, mode)
+  const identityOf = (toolName: string): { identity: ToolIdentity; info?: ReturnType<ExtensionAPI['getAllTools']>[number] } => {
+    let info: ReturnType<ExtensionAPI['getAllTools']>[number] | undefined
+    try {
+      info = pi.getAllTools().find(t => t.name === toolName)
+    } catch {
+      info = undefined
     }
-  })
-
-  pi.on('session_shutdown', async (_event, ctx) => {
-    rt.sessions.delete(sessionIdOf(ctx))
-    sessionState.delete(sessionIdOf(ctx))
-    await rt.releaseIfIdle()
-  })
-
-  // ---------- network: hosts the policy does not know ----------
-
-  rt.networkAsk = async (host, port) => {
-    // Attribute the connection to a running command so the review sees its session and task.
-    const running = [...rt.running.values()]
-    const owner = running.map(r => rt.sessions.get(r.sessionId)).find(Boolean) ?? [...rt.sessions.values()].at(-1)
-    if (!owner) return false
-    const config = configFor(owner.ctx)
-    if (effectiveMode(rt, config) === 'off') return true
-    const decision = await decide(
-      { rt, config, mode: effectiveMode(rt, config), ctx: owner.ctx, sessionId: owner.id },
-      {
-        kind: 'network',
-        title: `Connect to ${host}${port ? `:${port}` : ''}`,
-        reason: `${host} is not on the list of known package and code hosts`,
-        host,
-        port,
-        command: running.length ? running.map(r => r.command).join('\n---\n').slice(0, 4_000) : undefined,
-        cwd: running[0]?.cwd ?? owner.ctx.cwd,
-        sessionGrant: { label: host, apply: () => rt.grantedHosts.add(host) },
-      },
-    )
-    return decision.allow
+    if (!info) return { identity: { kind: 'unknown' } }
+    const path = info.sourceInfo?.path ?? ''
+    if (path.startsWith('builtin:')) {
+      const name = path.slice('builtin:'.length)
+      return { identity: PI_CORE_TOOLS.has(name) ? { kind: 'pi-builtin', name } : { kind: 'pi-extension', name }, info }
+    }
+    const ours = SELF !== '' && path === SELF
+    if (ours && toolName === 'bash' && isRunwayBash(info.parameters)) return { identity: { kind: 'runway' }, info }
+    if (ours && GUARDED_SEARCH_TOOLS.has(toolName)) return { identity: { kind: 'runway' }, info }
+    const companion = companionOwners.get(toolName)
+    if (ours && companion) return { identity: { kind: 'companion', companion }, info }
+    return { identity: { kind: 'extension', path }, info }
   }
 
-  // ---------- bash ----------
+  const metaFor = (toolName: string): ToolMeta => {
+    const { identity, info } = identityOf(toolName)
+    return {
+      identity,
+      source: identity.kind === 'pi-builtin' || identity.kind === 'runway' ? 'builtin' : identity.kind === 'pi-extension' && identity.name === 'mcp' ? 'mcp' : identity.kind === 'unknown' ? 'unknown' : 'extension',
+      sourcePath: info?.sourceInfo?.path,
+      namespace: (info as { namespace?: { name?: string } } | undefined)?.namespace?.name,
+      annotations: (info as { annotations?: ToolMeta['annotations'] } | undefined)?.annotations,
+      description: info?.description,
+    }
+  }
+
+  const decide = (op: Operation, ctx: ExtensionContext, signal?: AbortSignal): Promise<Verdict> => {
+    const { config } = configFor(ctx)
+    const sessionId = ctx.sessionManager.getSessionId()
+    const person = rt.personFor(sessionId)
+    return gate(op, {
+      rt, config, policy: policyFor(op.cwd, config), mode: effectiveMode(rt, config), ctx, sessionId, signal,
+      onProgress: text => {
+        if (person) refreshStatus(person.ctx, rt, effectiveMode(rt, config), text)
+      },
+    })
+  }
+
+  // ---------- the one gate ----------
+
+  pi.on('tool_call', async (event, ctx) => {
+    const { config } = configFor(ctx)
+    if (effectiveMode(rt, config) === 'off') return undefined
+    const input = (event.input ?? {}) as Record<string, unknown>
+    const op = normalize({
+      tool: event.toolName, input, cwd: ctx.cwd, toolCallId: event.toolCallId,
+      parentToolCallId: (event as { parentToolCallId?: string }).parentToolCallId, meta: metaFor(event.toolName),
+    })
+    const verdict = await decide(op, ctx, ctx.signal)
+    if (!verdict.allow) return { block: true, reason: verdict.message ?? 'Blocked by Runway.' }
+    // Runway's bash reads the decision back when it runs (and decides again if the arguments changed).
+    if (op.kind === 'shell') rt.recordApproval(ctx.sessionManager.getSessionId(), event.toolCallId, { inputKey: op.key, fullEnv: verdict.fullEnv, endpoints: approvedEndpoints(op, verdict) })
+    deepFreeze(event.input)
+    return undefined
+  })
+
+  // A call blocked or failed after our gate never reaches execute: drop its approval.
+  pi.on('tool_execution_end', (event, ctx) => {
+    rt.dropApproval(ctx.sessionManager.getSessionId(), event.toolCallId)
+  })
+
+  // ---------- bash: sandboxed, with scoped extra access or (reviewed) outside the sandbox ----------
 
   const template = createBashToolDefinition(process.cwd())
   const parameters = Type.Object({
     command: Type.String({ description: 'Bash command to execute' }),
     timeout: Type.Optional(Type.Number({ description: 'Timeout in seconds (optional, no default timeout)' })),
-    escalate: Type.Optional(
-      Type.Boolean({
-        description:
-          'Run outside the sandbox. Only use after the sandbox blocked something this task truly needs (a network host, a file outside the project, stored credentials). The request is reviewed.',
-      }),
-    ),
-    justification: Type.Optional(Type.String({ description: 'Required with escalate: one sentence on why this must run outside the sandbox.' })),
+    access: Type.Optional(Type.Object({
+      write: Type.Optional(Type.Array(Type.String(), { description: 'Extra folders this command must write to, outside the project (e.g. a sibling repository).' })),
+      hosts: Type.Optional(Type.Array(Type.String(), { description: 'Extra network hosts this command must reach (e.g. "api.example.com").' })),
+    }, { description: 'Ask for specific extra sandbox access for this one command. The request is reviewed.' })),
+    escalate: Type.Optional(Type.Boolean({ description: 'Run outside the sandbox with the user\'s full access. Only for things the sandbox cannot do even with `access` (stored credentials, Keychain, Docker). The request is reviewed.' })),
+    justification: Type.Optional(Type.String({ description: 'With access or escalate: one sentence on why this command needs it.' })),
   })
 
   pi.registerTool({
@@ -146,116 +201,165 @@ export default function runway(pi: ExtensionAPI): void {
     description: `${template.description} Commands run in a sandbox: the project and temp/cache folders are writable, credential stores are not readable, secret environment variables are removed, and only known package/code hosts are reachable (others are reviewed).`,
     promptGuidelines: [
       ...(template.promptGuidelines ?? []),
-      'bash runs inside a sandbox. Work inside the project; if a command fails with <sandbox_violations>, prefer an in-project alternative. Only if the task truly needs it, re-run with "escalate": true and a one-sentence "justification" — escalations are reviewed and may be declined.',
+      'bash runs inside a sandbox and every command is reviewed. If a command fails with <sandbox_violations>, first prefer a way inside the project. If it truly needs more, re-run with "access" (specific extra write folders or hosts) and a one-sentence "justification"; only use "escalate": true when it must run with the user\'s full access (stored credentials, Keychain, Docker).',
     ],
     parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const { command, timeout } = params
-      const config = configFor(ctx)
+      const { config } = configFor(ctx)
       const mode = effectiveMode(rt, config)
       const plain = { command, timeout }
-      if (mode === 'off') {
-        return createBashToolDefinition(ctx.cwd).execute(toolCallId, plain, signal, onUpdate, ctx)
+      if (mode === 'off') return createBashToolDefinition(ctx.cwd).execute(toolCallId, plain, signal, onUpdate, ctx)
+      const sessionId = ctx.sessionManager.getSessionId()
+      const op = normalize({ tool: 'bash', input: params as Record<string, unknown>, cwd: ctx.cwd, toolCallId, meta: metaFor('bash') })
+      let approved = rt.takeApproval(sessionId, toolCallId, op.key)
+      if (!approved) {
+        // The gate's decision was for different arguments (or none was recorded): decide again.
+        const verdict = await decide(op, ctx, signal ?? undefined)
+        if (!verdict.allow) throw new Error(verdict.message ?? 'Blocked by Runway.')
+        approved = { inputKey: op.key, fullEnv: verdict.fullEnv, endpoints: approvedEndpoints(op, verdict), sessionId }
       }
-      if (!params.escalate && rt.sandboxReady()) {
-        // Publishing, deploying, rewriting a shared remote or opening a remote shell
-        // takes effect on another machine; ask a person even inside the sandbox.
-        const outward = checkFloor(command, config.trustedCommands)
-        if (outward && OUTWARD_RULE_IDS.has(outward.id)) {
-          const decision = await decideFor(ctx, {
-            kind: 'outward',
-            title: `Run in the sandbox: ${command}`,
-            reason: `it ${outward.reason}; that happens outside this machine, so the sandbox cannot undo it`,
-            command,
-            tool: 'bash',
-            cwd: ctx.cwd,
-            floor: outward,
-          }, signal)
-          if (!decision.allow) throw new Error(decision.message)
-        }
-        const ops = sandboxedOperations(rt, toolCallId, ctx, cwd => policyFor(cwd, config), config.keepEnv)
-        return createBashToolDefinition(ctx.cwd, { operations: ops }).execute(toolCallId, plain, signal, onUpdate, ctx)
+      const { fullEnv, endpoints } = approved
+      if (op.execution === 'unsandboxed' || !rt.sandboxReady()) {
+        if (op.execution !== 'unsandboxed') throw new Error(`Runway: the sandbox is not running (${rt.sandboxError ?? 'not started'}), so commands can't run contained. Re-run with "escalate": true and a justification if this must run anyway; it will be reviewed as running outside the sandbox.`)
+        return createBashToolDefinition(ctx.cwd, { operations: directOperations(config.keepEnv, fullEnv) }).execute(toolCallId, plain, signal, onUpdate, ctx)
       }
-      const escalated = Boolean(params.escalate)
-      const decision = await decideFor(ctx, {
-        kind: escalated ? 'command' : 'sandbox-unavailable',
-        title: `Run without the sandbox: ${command}`,
-        reason: escalated ? 'the agent asked to run this command outside the sandbox' : `the sandbox is unavailable (${rt.sandboxError ?? 'not started'})`,
-        command,
-        justification: params.justification,
-        tool: 'bash',
-        cwd: ctx.cwd,
-        floor: checkFloor(command, config.trustedCommands),
-      }, signal)
-      if (!decision.allow) throw new Error(decision.message)
-      const ops = directOperations(config.keepEnv, decision.fullEnv)
+      const ops = sandboxedOperations(rt, toolCallId, ctx, cwd => policyFor(cwd, config), config.keepEnv, { write: op.access?.write ?? [], endpoints })
       return createBashToolDefinition(ctx.cwd, { operations: ops }).execute(toolCallId, plain, signal, onUpdate, ctx)
     },
   })
 
-  // Commands the user types with `!` are the user's own; sandbox them only on request.
+  // Pi's optional grep/find/ls, guarded so secrets files are never shown (still off unless you enable them).
+  for (const tool of guardedSearchTools((cwd, ctx) => policyFor(cwd, configFor(ctx).config))) pi.registerTool(tool)
+
+  // `!` commands are typed by you; they run as you typed them unless you ask for the sandbox.
   pi.on('user_bash', (_event, ctx) => {
-    const config = configFor(ctx)
+    const { config } = configFor(ctx)
     if (!config.sandboxUserCommands || effectiveMode(rt, config) === 'off' || !rt.sandboxReady()) return undefined
     return { operations: sandboxedOperations(rt, `user-${Date.now()}`, ctx, cwd => policyFor(cwd, config), config.keepEnv) }
   })
 
-  // ---------- Pi's own file tools ----------
+  // ---------- network: hosts the sandbox doesn't already allow ----------
 
-  pi.on('tool_call', async (event, ctx) => {
-    const tool = event.toolName
-    if (!['read', 'write', 'edit', 'grep', 'find', 'ls'].includes(tool)) return undefined
-    const config = configFor(ctx)
-    if (effectiveMode(rt, config) === 'off') return undefined
-    const input = (event.input ?? {}) as { path?: unknown }
-    const raw = typeof input.path === 'string' && input.path ? input.path : '.'
-    const path = resolveToolPath(raw, ctx.cwd)
-    const policy = policyFor(ctx.cwd, config)
-
-    let escalation: Escalation | undefined
-    if (tool === 'read') {
-      if ([...rt.grantedReadPaths].some(p => isWithin(path, p))) return undefined
-      const verdict = checkRead(path, policy)
-      if (!verdict.ok) {
-        const inStore = policy.denyRead.some(d => isWithin(path, d))
-        escalation = {
-          kind: 'read', title: `Read ${path}`, reason: verdict.reason, path, tool, cwd: ctx.cwd,
-          floor: inStore ? { id: 'credentials', reason: 'reads a credential store' } : undefined,
-          sessionGrant: { label: 'reading this file', apply: () => rt.grantedReadPaths.add(path) },
-        }
-      }
-    } else if (tool === 'write' || tool === 'edit') {
-      if ([...rt.grantedWriteRoots].some(p => isWithin(path, p))) {
-        const control = checkWrite(path, policy)
-        if (control.ok || !control.control) return undefined
-      }
-      const verdict = checkWrite(path, policy)
-      if (!verdict.ok) {
-        // A session approval covers the file's folder, unless that folder is your home or a system root.
-        const folder = dirname(path)
-        const scope = isBroadRoot(folder) ? path : folder
-        escalation = {
-          kind: 'write', title: `${tool === 'write' ? 'Write' : 'Edit'} ${path}`, reason: verdict.reason, path, tool, cwd: ctx.cwd,
-          floor: verdict.control ? { id: 'control-files', reason: 'changes a file that can run code outside the sandbox later' } : undefined,
-          sessionGrant: verdict.control ? undefined : { label: scope === path ? 'writing this file' : `Pi's writes in ${folder}`, apply: () => rt.grantedWriteRoots.add(scope) },
-        }
-      }
-    } else {
-      if ([...rt.grantedReadPaths].some(p => isWithin(path, p))) return undefined
-      const verdict = checkSearchRoot(path, policy, tool === 'grep')
-      if (!verdict.ok) {
-        escalation = {
-          kind: 'search', title: `${tool} in ${path}`, reason: verdict.reason, path, tool, cwd: ctx.cwd,
-          floor: { id: 'credentials', reason: 'searches inside credential stores' },
-          sessionGrant: { label: `searching ${path}`, apply: () => rt.grantedReadPaths.add(path) },
-        }
-      }
+  // Every connection out of the sandbox comes here (src/network.ts has the rules).
+  // The proxy only knows host and port, not which running command opened the
+  // connection, so it's allowed only if every command running at that moment
+  // may reach that host:port on its own.
+  const pendingNetwork = new Map<string, Promise<boolean>>()
+  const decisions = new WeakMap<object, Map<string, boolean>>()
+  const mayConnect = async (id: string, host: string, port: number | undefined): Promise<boolean> => {
+    const r = rt.running.get(id)
+    if (!r) return true // finished meanwhile: it isn't the requester
+    const session = rt.sessions.get(r.sessionId)
+    if (!session) return false
+    const { config } = configFor(session.ctx)
+    if (effectiveMode(rt, config) === 'off') return true
+    const op = networkOperation(host, port, r.cwd, [r.command])
+    const verdict0 = connectionVerdict(op, config, policyFor(r.cwd, config), r.endpoints)
+    if (verdict0 !== 'gate') return verdict0 === 'allow'
+    // Decided once per running command and host:port; "for this session" is a grant the gate keeps.
+    const decided = decisions.get(r) ?? new Map<string, boolean>()
+    decisions.set(r, decided)
+    const key = `${host}:${port ?? ''}`
+    const earlier = decided.get(key)
+    if (earlier !== undefined) return earlier
+    const verdict = await decide(op, session.ctx)
+    decided.set(key, verdict.allow)
+    return verdict.allow
+  }
+  rt.networkAsk = async (host, port) => {
+    const ids = [...rt.running.keys()]
+    if (ids.length === 0) {
+      // Something an earlier command left running. Nobody can be asked on its
+      // behalf: only what every open session would let through without asking.
+      return rt.sessions.size > 0 && [...rt.sessions.values()].every(s => {
+        const { config } = configFor(s.ctx)
+        if (effectiveMode(rt, config) === 'off') return true
+        return backgroundVerdict(networkOperation(host, port, s.ctx.cwd, []), config, policyFor(s.ctx.cwd, config))
+      })
     }
-    if (!escalation) return undefined
-    const decision = await decideFor(ctx, escalation)
-    return decision.allow ? undefined : { block: true, reason: decision.message }
+    for (const id of ids) {
+      const k = `${id}|${host}:${port ?? ''}`
+      let pending = pendingNetwork.get(k)
+      if (!pending) {
+        pending = mayConnect(id, host, port).finally(() => pendingNetwork.delete(k))
+        pendingNetwork.set(k, pending)
+      }
+      if (!(await pending)) return false
+    }
+    return true
+  }
+
+  // ---------- sessions and subagents ----------
+
+  const pendingNames = new Map<string, string[]>()
+  pi.events.on('subagents:child:spawning', (data: unknown) => {
+    const e = data as { agentName?: string; parentSessionId?: string }
+    if (!e.parentSessionId || !e.agentName) return
+    const queue = pendingNames.get(e.parentSessionId) ?? []
+    queue.push(e.agentName)
+    pendingNames.set(e.parentSessionId, queue)
+  })
+  pi.events.on('subagents:child:session-created', (data: unknown) => {
+    const e = data as { sessionId?: string; parentSessionId?: string }
+    if (!e.sessionId || !e.parentSessionId) return
+    rt.grants.setParent(e.sessionId, e.parentSessionId)
+    const name = pendingNames.get(e.parentSessionId)?.shift()
+    if (name) rt.agentNames.set(e.sessionId, name)
+  })
+  pi.events.on('subagents:child:disposed', (data: unknown) => {
+    const e = data as { sessionId?: string }
+    if (!e.sessionId) return
+    // A child session may be disposed without a shutdown event.
+    rt.sessions.delete(e.sessionId)
+    rt.grants.reset(e.sessionId)
+    rt.agentNames.delete(e.sessionId)
+    sessionState.delete(e.sessionId)
+    void rt.releaseIfIdle()
   })
 
-  registerUi(pi, rt, { effectiveMode: config => effectiveMode(rt, config), configFor, policyFor })
+  pi.on('session_start', async (event, ctx) => {
+    rt.agentDir = getAgentDir()
+    const id = ctx.sessionManager.getSessionId()
+    rt.sessions.set(id, { id, ctx, hasUI: ctx.hasUI })
+    rt.sessionsStarted = true
+    sessionState.delete(id)
+    const { config, problems } = configFor(ctx)
+    rt.reviewerKeyPresent = Boolean(await resolveReviewerKey(config.reviewer.route, ctx.modelRegistry ?? {}, process.env, rt.agentDir))
+    try {
+      verifyCompanions(companions, listedPackages(rt.agentDir, ctx.cwd, safeTrusted(ctx)), [...pi.getAllTools(), ...pi.getCommands()])
+    } catch {
+      // registry not readable: doctor shows the load-time state
+    }
+    const mode = effectiveMode(rt, config)
+    if (mode !== 'off') await rt.ensureSandbox(config, policyFor(ctx.cwd, config))
+    // Without a screen (pi -p, CI) settings problems go to stderr, so a broken rule is never silent.
+    if (!ctx.hasUI && !rt.grants.parentOf(id)) for (const problem of problems) process.stderr.write(`Runway settings: ${problem}\n`)
+    if (ctx.hasUI && !rt.grants.parentOf(id)) {
+      for (const problem of problems) ctx.ui.notify(`Runway settings: ${problem}`, 'warning')
+      if (mode !== 'off' && rt.sandboxState !== 'ready') ctx.ui.notify(`Runway: the sandbox did not start (${rt.sandboxError ?? 'unknown error'}). Commands won't run until it does, unless one is approved to run outside it.`, 'warning')
+      if ((event as { reason?: string }).reason === 'startup' && !rt.reviewerKeyPresent) ctx.ui.notify('Runway: no reviewer key, so you will be asked instead of Jev. Set OPENROUTER_API_KEY or /login to OpenRouter.', 'info')
+      for (const c of companions.filter(c => c.state === 'failed')) ctx.ui.notify(`Runway: bundled ${c.label.toLowerCase()} did not load (${c.detail})`, 'warning')
+      for (const c of companions.filter(c => c.state === 'inactive')) ctx.ui.notify(`Runway: ${c.label.toLowerCase()} is off — your ${c.pkg} is listed in Pi settings but not loaded. /runway doctor`, 'warning')
+      refreshStatus(ctx, rt, mode)
+    }
+  })
+
+  pi.on('session_shutdown', async (_event, ctx) => {
+    const id = ctx.sessionManager.getSessionId()
+    rt.sessions.delete(id)
+    sessionState.delete(id)
+    await rt.releaseIfIdle()
+  })
+
+  registerUi(pi, rt, { effectiveMode: config => effectiveMode(rt, config), configFor, policyFor, companions: () => companions, identityOf: name => identityOf(name).identity })
   registerWorktree(pi)
 }
+
+/** Runway's bash is the one that accepts `escalate` and `access`. */
+export function isRunwayBash(parameters: unknown): boolean {
+  const props = (parameters as { properties?: Record<string, unknown> } | undefined)?.properties
+  return Boolean(props && 'escalate' in props && 'access' in props)
+}
+
+export { COMPANIONS }

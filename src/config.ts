@@ -1,6 +1,8 @@
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { failSafeRule, parseRules, serializeRule } from './permissions/rules.ts'
+import type { Rule } from './permissions/rules.ts'
 
 // Runway settings. Everything is optional; the defaults are the product.
 //
@@ -17,8 +19,12 @@ export interface RunwayConfig {
   mode?: Mode
   /** reviewed: known dev hosts pass, new hosts are reviewed. open: any host. closed: known dev hosts only. */
   network: NetworkMode
-  /** What happens when the reviewer says no. block: the agent is told why and adapts. ask: you decide. */
+  /** When the reviewer says no. ask: you get the final word (when someone is at the screen). block: the agent is told why and adapts. */
   onDeny: OnDeny
+  /** Your permission rules (personal) plus the project's deny/ask rules. */
+  permissions: Rule[]
+  /** Bundled companions; each can be switched off. */
+  companions: { subagents: boolean; web: boolean; plan: boolean }
   /** Extra hosts that never need review (e.g. "api.mycompany.dev", "*.internal.example"). */
   allowHosts: string[]
   /** Extra folders commands may write to without review. */
@@ -29,8 +35,6 @@ export interface RunwayConfig {
   allowRead: string[]
   /** Environment variables that should stay visible to commands even though they look secret. */
   keepEnv: string[]
-  /** Regexes for commands you trust to skip the always-ask floor (they are still reviewed). */
-  trustedCommands: string[]
   /** Sandbox commands you type yourself with `!`. */
   sandboxUserCommands: boolean
   reviewer: {
@@ -44,13 +48,14 @@ export interface RunwayConfig {
 
 export const DEFAULT_CONFIG: RunwayConfig = {
   network: 'reviewed',
-  onDeny: 'block',
+  onDeny: 'ask',
+  permissions: [],
+  companions: { subagents: true, web: true, plan: true },
   allowHosts: [],
   allowWrite: [],
   denyRead: [],
   allowRead: [],
   keepEnv: [],
-  trustedCommands: [],
   sandboxUserCommands: false,
   reviewer: {
     route: 'openrouter',
@@ -88,8 +93,9 @@ function readJson(path: string): { value?: unknown; error?: string } {
   let text: string
   try {
     text = readFileSync(path, 'utf8')
-  } catch {
-    return {}
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    return { error: `${path}: can't be read (${(error as NodeJS.ErrnoException).code ?? String(error)})` }
   }
   try {
     return { value: JSON.parse(text) }
@@ -112,9 +118,11 @@ function oneOf<T extends string>(value: unknown, options: readonly T[], key: str
   return undefined
 }
 
-type Partial1 = Partial<Omit<RunwayConfig, 'reviewer'>> & { reviewer?: Partial<RunwayConfig['reviewer']> }
+type Partial1 = Partial<Omit<RunwayConfig, 'reviewer' | 'companions'>> & { reviewer?: Partial<RunwayConfig['reviewer']>; companions?: Partial<RunwayConfig['companions']> }
 
-export function parseConfig(value: unknown, path: string, problems: string[]): Partial1 {
+const KNOWN_KEYS = new Set(['mode', 'network', 'onDeny', 'permissions', 'companions', 'allowHosts', 'allowWrite', 'denyRead', 'allowRead', 'keepEnv', 'sandboxUserCommands', 'reviewer', '$schema'])
+
+export function parseConfig(value: unknown, path: string, problems: string[], source: 'personal' | 'project' = 'personal'): Partial1 {
   if (value === undefined) return {}
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     problems.push(`${path}: expected a JSON object`)
@@ -122,21 +130,32 @@ export function parseConfig(value: unknown, path: string, problems: string[]): P
   }
   const raw = value as Record<string, unknown>
   const out: Partial1 = {}
+  for (const key of Object.keys(raw)) {
+    if (key === 'trustedCommands') problems.push(`${path}: "trustedCommands" is no longer used. Write those commands as "permissions" rules, e.g. { "action": "allow", "command": "npm test*" }`)
+    else if (!KNOWN_KEYS.has(key)) problems.push(`${path}: unknown setting "${key}" (ignored)`)
+  }
   const mode = oneOf(raw.mode, MODES, 'mode', path, problems)
   if (mode) out.mode = mode
   const network = oneOf(raw.network, NETWORK, 'network', path, problems)
   if (network) out.network = network
   const onDeny = oneOf(raw.onDeny, ON_DENY, 'onDeny', path, problems)
   if (onDeny) out.onDeny = onDeny
-  for (const key of ['allowHosts', 'allowWrite', 'denyRead', 'allowRead', 'keepEnv', 'trustedCommands'] as const) {
+  for (const key of ['allowHosts', 'allowWrite', 'denyRead', 'allowRead', 'keepEnv'] as const) {
     const list = stringList(raw[key], key, path, problems)
     if (list) out[key] = list
   }
-  for (const pattern of out.trustedCommands ?? []) {
-    try {
-      new RegExp(pattern)
-    } catch {
-      problems.push(`${path}: trustedCommands entry is not a valid regex: ${pattern}`)
+  if (raw.permissions !== undefined) out.permissions = parseRules(raw.permissions, source, path, problems)
+  if (raw.companions !== undefined) {
+    if (!raw.companions || typeof raw.companions !== 'object' || Array.isArray(raw.companions)) problems.push(`${path}: "companions" must be an object`)
+    else {
+      const c = raw.companions as Record<string, unknown>
+      const companions: Partial<RunwayConfig['companions']> = {}
+      for (const key of ['subagents', 'web', 'plan'] as const) {
+        if (c[key] === undefined) continue
+        if (typeof c[key] === 'boolean') companions[key] = c[key] as boolean
+        else problems.push(`${path}: "companions.${key}" must be true or false`)
+      }
+      out.companions = companions
     }
   }
   if (raw.sandboxUserCommands !== undefined) {
@@ -183,6 +202,8 @@ export function applyProjectTightening(base: RunwayConfig, project: Partial1): R
   if (project.network && NETWORK_STRICTNESS[project.network] > NETWORK_STRICTNESS[base.network]) next.network = project.network
   if (project.onDeny === 'ask') next.onDeny = 'ask'
   if (project.denyRead) next.denyRead = [...base.denyRead, ...project.denyRead]
+  // parseRules already dropped any project allow/auto rule.
+  if (project.permissions) next.permissions = [...base.permissions, ...project.permissions]
   return next
 }
 
@@ -191,21 +212,31 @@ export function loadConfig(cwd: string, options: { projectTrusted: boolean; env?
   const sources: string[] = []
   const personalPath = personalConfigPath(options.env)
   const personal = readJson(personalPath)
-  if (personal.error) problems.push(personal.error)
+  // A settings file that exists but can't be read may hold restrictions: until it's fixed, everything asks.
+  const unreadable = (path: string, source: 'personal' | 'project', error: string): Rule => {
+    problems.push(`${error}; until it is fixed, every tool call asks you (headless: refused)`)
+    return failSafeRule(source === 'personal' ? 'p0' : 'r0', 'ask', source, path, undefined, error.replace(`${path}: `, ''))
+  }
+  const personalFallback = personal.error ? [unreadable(personalPath, 'personal', personal.error)] : personal.value !== undefined && (typeof personal.value !== 'object' || personal.value === null || Array.isArray(personal.value)) ? [unreadable(personalPath, 'personal', `${personalPath}: not a JSON object`)] : []
   if (personal.value !== undefined) sources.push(personalPath)
   const parsed = parseConfig(personal.value, personalPath, problems)
   let config: RunwayConfig = {
     ...DEFAULT_CONFIG,
     ...parsed,
+    permissions: [...personalFallback, ...(parsed.permissions ?? [])],
+    companions: { ...DEFAULT_CONFIG.companions, ...parsed.companions },
     reviewer: { ...DEFAULT_CONFIG.reviewer, ...parsed.reviewer },
   }
   if (options.projectTrusted) {
     const projectPath = projectConfigPath(cwd)
     const project = readJson(projectPath)
-    if (project.error) problems.push(project.error)
+    if (project.error) config = { ...config, permissions: [...config.permissions, unreadable(projectPath, 'project', project.error)] }
+    else if (project.value !== undefined && (typeof project.value !== 'object' || project.value === null || Array.isArray(project.value))) {
+      config = { ...config, permissions: [...config.permissions, unreadable(projectPath, 'project', `${projectPath}: not a JSON object`)] }
+    }
     if (project.value !== undefined) {
       sources.push(projectPath)
-      config = applyProjectTightening(config, parseConfig(project.value, projectPath, problems))
+      config = applyProjectTightening(config, parseConfig(project.value, projectPath, problems, 'project'))
     }
   }
   const envMode = (options.env ?? process.env).PI_RUNWAY_MODE
@@ -214,4 +245,43 @@ export function loadConfig(cwd: string, options: { projectTrusted: boolean; env?
     else problems.push(`PI_RUNWAY_MODE must be one of ${MODES.join(', ')}`)
   }
   return { config, problems, sources }
+}
+
+// ---------- saving rules ----------
+
+function readObject(path: string): Record<string, unknown> {
+  const { value, error } = readJson(path)
+  if (error) throw new Error(`${error}; fix it before saving rules`)
+  if (value === undefined) return {}
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${path} is not a JSON object`)
+  return value as Record<string, unknown>
+}
+
+function writeObject(path: string, value: Record<string, unknown>): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`)
+  renameSync(tmp, path)
+}
+
+/** Append an allow/deny/ask/auto rule to your personal settings. Other settings are kept as they are. */
+export function savePersonalRule(rule: Omit<Rule, 'id' | 'source'>, env: NodeJS.ProcessEnv = process.env): string {
+  const path = personalConfigPath(env)
+  const obj = readObject(path)
+  if (obj.permissions !== undefined && !Array.isArray(obj.permissions)) throw new Error(`"permissions" in ${path} is not a list; fix it before saving rules`)
+  const list = Array.isArray(obj.permissions) ? [...obj.permissions] : []
+  list.push(serializeRule({ ...rule, id: '', source: 'personal' }))
+  obj.permissions = list
+  writeObject(path, obj)
+  return path
+}
+
+/** Remove personal rule number `index` (0-based, as listed). */
+export function removePersonalRule(index: number, env: NodeJS.ProcessEnv = process.env): boolean {
+  const path = personalConfigPath(env)
+  const obj = readObject(path)
+  if (!Array.isArray(obj.permissions) || index < 0 || index >= obj.permissions.length) return false
+  obj.permissions = obj.permissions.filter((_, i) => i !== index)
+  writeObject(path, obj)
+  return true
 }

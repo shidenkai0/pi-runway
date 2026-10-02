@@ -3,9 +3,13 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { BashOperations, ExtensionContext } from '@earendil-works/pi-coding-agent'
+import { callKey } from './runtime.ts'
 import type { Runtime } from './runtime.ts'
+import { isBroadRoot } from './policy.ts'
 import type { Policy } from './policy.ts'
 import { scrubEnv } from './env.ts'
+import { ensureCommonCaches, gitExcludeEnv, nestedControlPaths } from './linux.ts'
+import type { Endpoint } from './permissions/operation.ts'
 
 // Running commands. Sandboxed commands are wrapped by sandbox-runtime
 // (Seatbelt on macOS, bubblewrap on Linux) with per-command filesystem rules
@@ -92,32 +96,55 @@ function run(options: SpawnOptions): Promise<{ exitCode: number | null }> {
   })
 }
 
+export interface CommandAccess {
+  /** Extra folders this one command may write (approved with the command). */
+  write: string[]
+  /** Where this command was approved to connect (see ApprovedCall.endpoints). */
+  endpoints: Endpoint[]
+}
+
 export function sandboxedOperations(
   rt: Runtime,
   toolCallId: string,
   ctx: ExtensionContext,
   policyFor: (cwd: string) => Policy,
   keepEnv: readonly string[],
+  access: CommandAccess = { write: [], endpoints: [] },
 ): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
       const policy = policyFor(cwd)
-      const wrapped = await rt.sandbox.wrapWithSandbox(
-        command,
-        'bash',
-        // Approvals for Pi's own file tools never widen what commands may write.
-        { filesystem: { denyRead: policy.denyRead, allowRead: policy.allowRead, allowWrite: policy.allowWrite, denyWrite: policy.denyWrite } },
-        signal,
-        { commandId: toolCallId, commandText: command },
-      )
+      const id = callKey(ctx.sessionManager.getSessionId(), toolCallId)
+      // Requested write access never reaches protected control paths: denies win in the sandbox.
+      const allowWrite = [...policy.allowWrite, ...access.write]
+      const base = commandEnv(env ?? process.env, keepEnv)
+      const excludes = gitExcludeEnv(cwd, policy.denyWrite, base)
+      // Linux can't take `**` denies: list the nested control folders that exist right now
+      // (the cached policy may predate one the previous command created).
+      ensureCommonCaches()
+      const nested = process.platform === 'linux' && !isBroadRoot(policy.workspace) ? nestedControlPaths(policy.workspace) : []
+      const denyWrite = [...new Set([...policy.denyWrite, ...nested, ...(excludes ? [excludes.dir] : [])])]
+      let wrapped: string
+      try {
+        wrapped = await rt.sandbox.wrapWithSandbox(
+          command,
+          'bash',
+          { filesystem: { denyRead: policy.denyRead, allowRead: policy.allowRead, allowWrite, denyWrite } },
+          signal,
+          { commandId: id, commandText: command },
+        )
+      } catch (error) {
+        excludes?.cleanup()
+        throw error
+      }
       const stderr: Buffer[] = []
       let stderrBytes = 0
-      rt.running.set(toolCallId, { command, cwd, sessionId: ctx.sessionManager.getSessionId() })
+      rt.running.set(id, { command, cwd, sessionId: ctx.sessionManager.getSessionId(), endpoints: [...access.endpoints] })
       try {
         const result = await run({
           wrapped,
           cwd,
-          env: commandEnv(env ?? process.env, keepEnv),
+          env: excludes ? { ...base, ...excludes.env } : base,
           onData,
           signal,
           timeout,
@@ -132,7 +159,7 @@ export function sandboxedOperations(
           // Seatbelt reports violations through the system log a moment after the fact.
           if (process.platform === 'darwin') await new Promise(r => setTimeout(r, 150))
           const text = Buffer.concat(stderr).toString('utf8')
-          const annotated = rt.sandbox.annotateStderrWithSandboxFailures(toolCallId, text)
+          const annotated = rt.sandbox.annotateStderrWithSandboxFailures(id, text)
           const extra = annotated.startsWith(text) ? annotated.slice(text.length) : annotated
           // Lines without a target (e.g. a bare "network-outbound") are background noise, not the cause.
           const violations = extra.split('\n').filter(line => VIOLATION_LINE.test(line) && !/network-outbound\s*$/.test(line))
@@ -142,7 +169,8 @@ export function sandboxedOperations(
         }
         return result
       } finally {
-        rt.running.delete(toolCallId)
+        rt.running.delete(id)
+        excludes?.cleanup()
         // The session may have ended while this command ran (pi -p); stop the sandbox now.
         if (rt.sessions.size === 0) void rt.releaseIfIdle()
         try {

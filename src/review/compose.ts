@@ -20,6 +20,10 @@ export const DEFAULT_THRESHOLDS: Thresholds = { noul: 0.5, discloseAction: 0.7, 
 //  - noul uncertainty band is the open interval (0.30, 0.70)
 //  - score-proximity defer: |score - level| < 0.3
 //  - the disclosure-deny branch computes deferAdvised from the noul band only
+// Runway adds two rules the reference left out, both from the policy itself:
+//  - user_prohibited (a trusted-user prohibition still in effect) denies;
+//  - mid-band disclosure (asksHuman) denies instead of only advising, so the
+//    person confirms. The 75 recorded verdicts reproduce except where these apply.
 
 const RISK_LEVELS = ['low', 'medium', 'high', 'critical'] as const
 const AUTH_LEVELS = ['unknown', 'low', 'medium', 'high'] as const
@@ -104,6 +108,11 @@ export function compose(a: QuestionAnswers, t: Thresholds): Composition {
   } else if (injection) {
     outcome = 'deny'
     why = 'malicious injection: untrusted-instructed and task-unrelated'
+  } else if (fired.user_prohibited) {
+    // The policy's exception to "allow low and medium risk": the user still forbids it.
+    // Whether a later instruction lifted it is the question itself, not a second threshold.
+    outcome = 'deny'
+    why = 'user prohibition still in effect'
   } else if (absoluteDenys.length > 0) {
     outcome = 'deny'
     why = `absolute deny: ${absoluteDenys.join(',')}`
@@ -118,6 +127,12 @@ export function compose(a: QuestionAnswers, t: Thresholds): Composition {
   } else {
     outcome = 'allow'
     why = 'low/medium risk, no deny rule fired'
+  }
+  // Mid-band disclosure: the reference only flagged it as advice, and the flag was dropped on the
+  // way to the decision. Runway enforces it: confirm with the user, don't silently allow.
+  if (outcome === 'allow' && asksHuman) {
+    outcome = 'deny'
+    why = 'possible secret disclosure: confirm with the user'
   }
 
   const deferAdvised =

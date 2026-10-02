@@ -1,6 +1,9 @@
 // Workflow matrix: how often does everyday developer work need to leave the
 // sandbox? Runs real tool commands (real registries, free) through Runway's
-// sandboxed bash operations, in a throwaway HOME. No model, no reviewer.
+// sandboxed bash operations, in a throwaway HOME. No model, no reviewer:
+// connections get Runway's own decision without anyone to ask (known hosts
+// pass, anything that would need a review is refused and recorded).
+// Exits non-zero when a routine workflow is blocked or fails.
 //
 //   node test/matrix/run.ts            # all workflows available on this machine
 //   node test/matrix/run.ts npm cargo  # a subset
@@ -27,6 +30,8 @@ const { Runtime } = await import('../../src/runtime.ts')
 const { buildPolicy, clearGitCache } = await import('../../src/policy.ts')
 const { DEFAULT_CONFIG } = await import('../../src/config.ts')
 const { sandboxedOperations } = await import('../../src/bash.ts')
+const { connectionVerdict } = await import('../../src/network.ts')
+const { networkOperation } = await import('../../src/permissions/operation.ts')
 
 interface Workflow {
   name: string
@@ -34,6 +39,8 @@ interface Workflow {
   command: string
   /** Expected to need an escalation (documented limitation), not a smoothness failure. */
   expectEscalation?: boolean
+  /** A shell check that the toolchain is complete enough to try (outside the sandbox). */
+  probe?: string
 }
 
 const WORKFLOWS: Workflow[] = [
@@ -44,7 +51,7 @@ const WORKFLOWS: Workflow[] = [
   { name: 'pnpm add', needs: 'pnpm', command: 'printf "{\\"name\\":\\"x\\",\\"version\\":\\"1.0.0\\"}" > package.json && pnpm add is-number@7 2>&1 | tail -2 && node -e "require(\'is-number\')"' },
   { name: 'yarn add', needs: 'yarn', command: 'yarn init -y >/dev/null && yarn add is-number@7 2>&1 | tail -1' },
   { name: 'bun add', needs: 'bun', command: 'bun init -y >/dev/null 2>&1; bun add is-number@7 2>&1 | tail -1' },
-  { name: 'python venv + pip', needs: 'python3', command: 'python3 -m venv .venv && .venv/bin/pip install -q --disable-pip-version-check six && .venv/bin/python -c "import six; print(six.__name__)"' },
+  { name: 'python venv + pip', needs: 'python3', probe: 'python3 -c "import ensurepip, venv"', command: 'python3 -m venv .venv && .venv/bin/pip install -q --disable-pip-version-check six && .venv/bin/python -c "import six; print(six.__name__)"' },
   { name: 'uv project', needs: 'uv', command: 'uv init -q --no-workspace --name demo . && uv add -q six && uv run -q python -c "import six; print(six.__name__)"' },
   { name: 'cargo build with a crate', needs: 'cargo', command: 'cargo init -q --name hello && cargo add -q itoa@1 && cargo build -q && ./target/debug/hello' },
   { name: 'deno', needs: 'deno', command: 'deno eval "console.log(40 + 2)"' },
@@ -62,9 +69,9 @@ const WORKFLOWS: Workflow[] = [
   { name: 'unknown host', needs: 'curl', command: 'curl -sS -m 5 -o /dev/null https://example.com/ 2>&1', expectEscalation: true },
 ]
 
-function has(tool: string): boolean {
+function has(tool: string, probe?: string): boolean {
   try {
-    execFileSync('bash', ['-lc', `command -v ${tool}`], { stdio: 'ignore', env: process.env })
+    execFileSync('bash', ['-lc', probe ?? `command -v ${tool}`], { stdio: 'ignore', env: process.env })
     return true
   } catch {
     return false
@@ -72,13 +79,17 @@ function has(tool: string): boolean {
 }
 
 const only = process.argv.slice(2)
-const selected = WORKFLOWS.filter(w => (only.length === 0 || only.some(o => w.name.includes(o) || w.needs === o)) && has(w.needs))
+const selected = WORKFLOWS.filter(w => (only.length === 0 || only.some(o => w.name.includes(o) || w.needs === o)) && has(w.needs, w.probe))
 const skipped = WORKFLOWS.filter(w => !selected.includes(w) && (only.length === 0 || only.some(o => w.name.includes(o) || w.needs === o)))
 
 const rt = new Runtime(SandboxManager)
 rt.agentDir = join(fakeHome, '.pi', 'agent')
 const asked: string[] = []
 rt.networkAsk = async (host, port) => {
+  const running = [...rt.running.values()][0]
+  const cwd = running?.cwd ?? fakeHome
+  const verdict = connectionVerdict(networkOperation(host, port, cwd, [running?.command ?? '']), DEFAULT_CONFIG, buildPolicy(cwd, DEFAULT_CONFIG, rt.agentDir), running?.endpoints ?? [])
+  if (verdict === 'allow') return true
   asked.push(`${host}:${port}`)
   return false
 }
@@ -119,3 +130,4 @@ const smooth = routine.filter(r => r.result === 'ok').length
 console.log(`\nroutine workflows without escalation: ${smooth}/${routine.length}`)
 if (skipped.length) console.log(`skipped (tool not installed): ${skipped.map(s => s.name).join(', ')}`)
 if (!process.env.KEEP) rmSync(base, { recursive: true, force: true })
+if (smooth < routine.length) process.exitCode = 1

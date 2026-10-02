@@ -41,14 +41,21 @@ test('defaults need no file; bad settings are reported, not fatal', () => {
     const none = loadConfig(t.project, { projectTrusted: true, env: { PI_CODING_AGENT_DIR: t.agent } })
     assert.deepEqual(none.problems, [])
     assert.equal(none.config.network, 'reviewed')
-    assert.equal(none.config.onDeny, 'block')
+    assert.equal(none.config.onDeny, 'ask')
     assert.equal(none.config.mode, undefined)
     writeFileSync(join(t.agent, 'runway.json'), JSON.stringify({ mode: 'yolo', network: 'open', allowHosts: 'x' }))
     const bad = loadConfig(t.project, { projectTrusted: true, env: { PI_CODING_AGENT_DIR: t.agent } })
     assert.equal(bad.config.network, 'open')
     assert.equal(bad.problems.length, 2)
     writeFileSync(join(t.agent, 'runway.json'), '{ nope')
-    assert.equal(loadConfig(t.project, { projectTrusted: true, env: { PI_CODING_AGENT_DIR: t.agent } }).problems.length, 1)
+    const corrupt = loadConfig(t.project, { projectTrusted: true, env: { PI_CODING_AGENT_DIR: t.agent } })
+    assert.equal(corrupt.problems.length, 1)
+    assert.match(corrupt.problems[0]!, /not valid JSON.*every tool call asks you/)
+    assert.deepEqual(corrupt.config.permissions.map(r => [r.action, r.tool, Boolean(r.invalid)]), [['ask', undefined, true]], 'unreadable settings never mean "no restrictions"')
+    writeFileSync(join(t.agent, 'runway.json'), '{}')
+    writeFileSync(join(t.project, '.pi', 'runway.json'), '[not json')
+    const project = loadConfig(t.project, { projectTrusted: true, env: { PI_CODING_AGENT_DIR: t.agent } })
+    assert.deepEqual(project.config.permissions.map(r => [r.action, r.source]), [['ask', 'project']])
   } finally {
     t.done()
   }
@@ -68,6 +75,21 @@ test('a project can tighten but never loosen', () => {
   assert.deepEqual(tightened.denyRead, ['secrets/'])
 })
 
+test('a trusted project config with the wrong JSON shape keeps a restrictive fallback', () => {
+  const t = tempAgent()
+  try {
+    for (const shape of [[], null, 'not an object']) {
+      writeFileSync(join(t.project, '.pi', 'runway.json'), JSON.stringify(shape))
+      const loaded = loadConfig(t.project, { projectTrusted: true, env: { PI_CODING_AGENT_DIR: t.agent } })
+      assert.deepEqual(loaded.config.permissions.map(r => [r.action, r.source, Boolean(r.invalid)]), [['ask', 'project', true]])
+      assert.ok(loaded.problems.some(p => /every tool call asks you/.test(p)))
+      assert.deepEqual(loadConfig(t.project, { projectTrusted: false, env: { PI_CODING_AGENT_DIR: t.agent } }).config.permissions, [])
+    }
+  } finally {
+    t.done()
+  }
+})
+
 test('untrusted project settings are ignored; env override applies', () => {
   const t = tempAgent()
   try {
@@ -78,4 +100,12 @@ test('untrusted project settings are ignored; env override applies', () => {
   } finally {
     t.done()
   }
+})
+
+test('settings from the earlier prototype get a migration hint, unknown keys a warning', async () => {
+  const { parseConfig } = await import('../../src/config.ts')
+  const problems: string[] = []
+  parseConfig({ trustedCommands: ['^npm test$'], netwrok: 'open' }, 'runway.json', problems)
+  assert.ok(problems.some(p => /trustedCommands" is no longer used.*permissions/.test(p)), problems.join('\n'))
+  assert.ok(problems.some(p => /unknown setting "netwrok"/.test(p)))
 })

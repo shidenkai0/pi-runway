@@ -61,10 +61,13 @@ test('/runway doctor explains the setup and flags conflicting packages', async (
     assert.match(text, /Sandbox ready/)
     assert.match(text, /Runway runs the bash tool/)
     assert.match(text, /Reviewer key found/)
-    assert.match(text, /pi-permission-system is installed/)
-    assert.match(text, /Runway auto — sandboxed; Jev reviews/)
-    assert.match(text, /Runway ask — sandboxed; you review/)
-    assert.match(text, /nothing has left the sandbox yet/)
+    assert.match(text, /pi-permission-system is also installed/)
+    assert.match(text, /Subagents: bundled @gotgenes\/pi-subagents/)
+    assert.match(text, /Plan mode: bundled/)
+    assert.match(text, /Web search and fetch: bundled/)
+    assert.match(text, /auto — your rules first, Jev reviews the rest/)
+    assert.match(text, /Runway ask — your rules first, you review the rest/)
+    assert.match(text, /nothing has needed a decision yet/)
   } finally {
     h.cleanup()
   }

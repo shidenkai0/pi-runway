@@ -4,8 +4,10 @@ import type { ExtensionContext } from '@earendil-works/pi-coding-agent'
 import { SandboxManager } from '@anthropic-ai/sandbox-runtime'
 import type { Mode, RunwayConfig } from './config.ts'
 import type { Policy } from './policy.ts'
+import { GrantStore } from './permissions/grants.ts'
 import { AvailabilityBreaker } from './review/availability.ts'
 import { redactSecrets } from './review/redact.ts'
+import type { Endpoint } from './permissions/operation.ts'
 
 // Process-wide state. Pi may load this extension more than once in one
 // process (in-process subagents get their own copy of every extension), so
@@ -24,6 +26,8 @@ export interface RunningCommand {
   command: string
   cwd: string
   sessionId: string
+  /** Where this command may connect beyond the policy's hosts; grows as its own network requests are approved. */
+  endpoints: Endpoint[]
 }
 
 export interface LogEntry {
@@ -32,12 +36,27 @@ export interface LogEntry {
   kind: string
   summary: string
   decision: 'allowed' | 'denied'
-  by: 'reviewer' | 'person' | 'floor' | 'session-grant' | 'policy' | 'unavailable'
+  by: 'reviewer' | 'person' | 'rule' | 'default' | 'grant' | 'mode' | 'unavailable'
   why?: string
   latencyMs?: number
+  tool?: string
+}
+
+/** Tool call ids are only unique within a session: approvals and running commands are keyed by both. */
+export function callKey(sessionId: string, toolCallId: string): string {
+  return `${sessionId}\u0000${toolCallId}`
 }
 
 export type NetworkAsk = (host: string, port: number | undefined) => Promise<boolean>
+
+/** What the gate decided for a tool call, read back when the tool runs. */
+export interface ApprovedCall {
+  inputKey: string
+  fullEnv: boolean
+  /** Where this call was approved to connect (requested as access, or named in a command someone reviewed). */
+  endpoints: Endpoint[]
+  sessionId: string
+}
 
 export class Runtime {
   readonly sandbox: SandboxApi
@@ -48,20 +67,45 @@ export class Runtime {
 
   /** Session-level override set with /runway or the shortcut; undefined = use config/default. */
   modeOverride: Mode | undefined
-  /** Last effective mode computed at session start; used by the status line. */
-  lastMode: Mode = 'ask'
   config: RunwayConfig | undefined
   configProblems: string[] = []
   agentDir = ''
   reviewerKeyPresent = false
 
   readonly sessions = new Map<string, SessionInfo>()
+  readonly grants = new GrantStore()
+  /** Subagent session id → its agent name (from pi-subagents' lifecycle events). */
+  readonly agentNames = new Map<string, string>()
+  /** callKey(session, toolCallId) → what the gate approved (checked again when the tool runs). */
+  readonly approved = new Map<string, ApprovedCall>()
+
+  /** The gate allowed this call: remember how, for when the tool runs. */
+  recordApproval(sessionId: string, toolCallId: string, approval: Omit<ApprovedCall, 'sessionId'>): void {
+    this.approved.set(callKey(sessionId, toolCallId), { ...approval, sessionId })
+  }
+
+  /**
+   * The decision recorded for this session's call, used up. Only if it was
+   * for exactly this operation; anything else means decide again.
+   */
+  takeApproval(sessionId: string, toolCallId: string, opKey: string): ApprovedCall | undefined {
+    const key = callKey(sessionId, toolCallId)
+    const approval = this.approved.get(key)
+    this.approved.delete(key)
+    return approval && approval.sessionId === sessionId && approval.inputKey === opKey ? approval : undefined
+  }
+
+  dropApproval(sessionId: string, toolCallId: string): void {
+    this.approved.delete(callKey(sessionId, toolCallId))
+  }
+  readonly stats = { allowed: 0, reviewed: 0, asked: 0, denied: 0 }
+  /** Bundled companions and how they loaded (for /runway doctor). */
+  companions: import('./companions.ts').CompanionStatus[] = []
+  /** Bumped whenever settings change, so cached per-session config reloads. */
+  configGeneration = 0
   /** Set once a Pi session has started; the sandbox is only released after sessions existed and all ended. */
   sessionsStarted = false
   readonly running = new Map<string, RunningCommand>()
-  readonly grantedHosts = new Set<string>()
-  readonly grantedWriteRoots = new Set<string>()
-  readonly grantedReadPaths = new Set<string>()
   readonly breaker = new AvailabilityBreaker()
   readonly recent: LogEntry[] = []
   /** Set by ui.ts: tell a person what just left the sandbox. */
@@ -110,12 +154,13 @@ export class Runtime {
       const network: Record<string, unknown> = {
         deniedDomains: policy.deniedHosts,
         allowLocalBinding: true,
-        strictAllowlist: config.network === 'closed',
+        strictAllowlist: false,
       }
-      // "open" means no domain filter at all: no allowedDomains key.
-      if (config.network !== 'open') network.allowedDomains = policy.allowHosts
+      // Every connection comes to networkAsk, even to well-known hosts and in
+      // "open" mode, so your host rules apply to all of them; networkAsk
+      // allows known hosts (and, in open mode, any host) quickly.
+      network.allowedDomains = []
       const ask = async ({ host, port }: { host: string; port: number | undefined }): Promise<boolean> => {
-        if (this.grantedHosts.has(host)) return true
         if (!this.networkAsk) return false
         return this.networkAsk(host, port)
       }
@@ -157,10 +202,9 @@ export class Runtime {
     }
     this.sandboxState = 'idle'
     this.networkMode = undefined
-    // "For this session" approvals end with the session.
-    this.grantedHosts.clear()
-    this.grantedWriteRoots.clear()
-    this.grantedReadPaths.clear()
+    // Session approvals are keyed by session id and stay for the life of this
+    // Pi process, so switching back to an earlier session finds them again.
+    this.approved.clear()
   }
 
   sandboxReady(): boolean {
@@ -169,13 +213,24 @@ export class Runtime {
 
   // ---------- people ----------
 
-  /** The session that can show a dialog: this one if it has a UI, otherwise the most recent one that does. */
+  /**
+   * Who can answer for this session: the session itself if it has a screen,
+   * otherwise the nearest ancestor that does (a subagent asks its parent).
+   * Unrelated sessions are never asked.
+   */
   personFor(sessionId: string): SessionInfo | undefined {
-    const own = this.sessions.get(sessionId)
-    if (own?.hasUI) return own
-    let found: SessionInfo | undefined
-    for (const info of this.sessions.values()) if (info.hasUI) found = info
-    return found
+    for (const id of this.grants.lineage(sessionId)) {
+      const info = this.sessions.get(id)
+      if (info?.hasUI) return info
+    }
+    return undefined
+  }
+
+  /** "The agent" or `Subagent "worker"`. */
+  whoIs(sessionId: string): string {
+    if (!this.grants.parentOf(sessionId)) return 'The agent'
+    const name = this.agentNames.get(sessionId)
+    return name ? `Subagent "${name}"` : 'A subagent'
   }
 
   /** Dialogs are shown one at a time, even when parallel tool calls or subagents escalate together. */
