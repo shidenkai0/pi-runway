@@ -405,3 +405,21 @@ export function checkWrite(path: string, policy: Policy): PathVerdict {
   }
   return { ok: true }
 }
+
+/**
+ * buildPolicy, cached briefly per working folder and settings object. A
+ * session's settings object is replaced whenever its settings change, so
+ * changed settings never get a policy built from the old ones.
+ */
+export function policyCache(build: (cwd: string, config: RunwayConfig) => Policy, ttlMs = 5_000): (cwd: string, config: RunwayConfig) => Policy {
+  const cache = new WeakMap<RunwayConfig, Map<string, { at: number; policy: Policy }>>()
+  return (cwd, config) => {
+    const forConfig = cache.get(config) ?? new Map<string, { at: number; policy: Policy }>()
+    cache.set(config, forConfig)
+    const hit = forConfig.get(cwd)
+    if (hit && Date.now() - hit.at < ttlMs) return hit.policy
+    const policy = build(cwd, config)
+    forConfig.set(cwd, { at: Date.now(), policy })
+    return policy
+  }
+}

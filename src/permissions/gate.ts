@@ -48,11 +48,11 @@ export interface GateContext {
   /** Status updates while a review is running. */
   onProgress?: (text: string | undefined) => void
   /**
-   * Replaying a recorded case (eval/run.ts): its recorded transcript instead
-   * of the session's, the recorded permission request as evidence, and no
-   * working folder or full arguments (none were recorded).
+   * Replaying an eval case (eval/run.ts): its transcript instead of the
+   * session's; for a historical case the recorded permission request as
+   * evidence and what was never recorded; for a public case its working folder.
    */
-  replay?: { transcript: object[]; recordedRequest: Record<string, unknown>; notRecorded: string[] }
+  replay?: { transcript: object[]; recordedRequest?: Record<string, unknown>; notRecorded: string[]; cwd?: string }
   /** Told every reviewer answer or failure, as structured data (eval/run.ts records them). */
   onReview?: (result: { verdict: JevVerdict } | { failure: string; latencyMs: number }) => void
 }
@@ -183,9 +183,10 @@ export function reviewerAction(op: Operation, g: GateContext): Record<string, un
     kind: op.kind,
     request: `The coding agent wants to call the tool "${op.tool}": ${op.summary}`,
     execution: exec.text,
-    cwd: g.replay ? 'not recorded' : op.cwd,
+    cwd: g.replay ? (g.replay.cwd ?? 'not recorded') : op.cwd,
     input: op.input,
-    ...(g.replay ? { recordedRequest: g.replay.recordedRequest, notRecorded: g.replay.notRecorded } : {}),
+    ...(g.replay?.recordedRequest ? { recordedRequest: g.replay.recordedRequest } : {}),
+    ...(g.replay?.notRecorded.length ? { notRecorded: g.replay.notRecorded } : {}),
   }
   if (op.command) action.command = op.command
   if (op.shell?.opaque) action.cannotAnalyze = op.shell.opaqueReasons
@@ -226,12 +227,17 @@ interface AskOptions {
 async function askPerson(op: Operation, g: GateContext, o: AskOptions): Promise<Verdict> {
   const { rt } = g
   const person = rt.personFor(g.sessionId)
-  if (!person) return refuse('unavailable', o.unattended)
+  if (!person) {
+    rt.tally.for(g.sessionId).unattended += 1
+    return refuse('unavailable', o.unattended)
+  }
   const exec = describeExecution(op, g.policy)
   const choice: ApprovalChoice | undefined = await rt.serialize(() => {
     // Someone may have approved the same thing while this call waited its turn.
     if (rt.grants.findPersonGrant(g.sessionId, op, 'operation')) return Promise.resolve({ kind: 'once' } as ApprovalChoice)
     rt.stats.asked += 1
+    // Counted for the session that asked, even when its parent's screen shows the dialog.
+    rt.tally.for(g.sessionId).prompts += 1
     return requestApproval(person.ctx, {
       tool: op.mcp ? `${op.mcp.server} · MCP` : op.tool,
       who: rt.whoIs(g.sessionId),
@@ -297,9 +303,14 @@ async function review(op: Operation, g: GateContext, why: string): Promise<Verdi
     verdict = await askJev({ action: reviewerAction(op, g), transcript }, key, config.reviewer, { fetchImpl: g.fetchImpl, signal: g.signal })
     rt.breaker.recordSuccess()
     g.onReview?.({ verdict })
+    const t = rt.tally.for(g.sessionId)
+    if (verdict.outcome === 'allow') t.jev.allowed += 1
+    else t.jev.refused += 1
+    rt.tally.jevLatency(g.sessionId, verdict.latencyMs)
   } catch (error) {
     if (error instanceof ReviewerError && error.kind === 'cancelled') return refuse('unavailable', 'Cancelled.')
     rt.breaker.recordFailure()
+    rt.tally.for(g.sessionId).jev.failed += 1
     const detail = error instanceof Error ? error.message : String(error)
     g.onReview?.({ failure: error instanceof ReviewerError ? error.kind : 'error', latencyMs: Date.now() - started })
     return askPerson(op, g, { why: `The reviewer could not decide (${detail})`, whyTone: 'warning', unattended: unattended(`the reviewer could not decide (${detail})`) })
@@ -326,6 +337,18 @@ export async function gate(op: Operation, g: GateContext): Promise<Verdict> {
   const done = (v: Verdict, why?: string): Verdict => {
     if (v.allow) rt.stats.allowed += 1
     else rt.stats.denied += 1
+    if (op.kind !== 'network') {
+      const t = rt.tally.for(g.sessionId)
+      t.toolCalls += 1
+      if (op.kind === 'shell') t.commands += 1
+      if (!v.allow) t.refused += 1
+      // Allowed to act outside the sandbox (or inside Pi) by someone's decision, not a routine default.
+      if (v.allow && (op.execution === 'unsandboxed' || op.execution === 'in-process') && v.by !== 'default') {
+        if (v.by === 'reviewer') t.outside.jev += 1
+        else if (v.by === 'person') t.outside.you += 1
+        else t.outside.rulesOrGrants += 1
+      }
+    }
     // Quiet success: routine allows by rules and defaults aren't logged one by one.
     if (!(v.allow && (v.by === 'default' || v.by === 'rule' || v.by === 'grant')) && v.by !== 'reviewer') {
       rt.record({ session: g.sessionId, kind: op.kind, summary: op.summary, decision: v.allow ? 'allowed' : 'denied', by: v.by, why: why ?? v.message, tool: op.tool })

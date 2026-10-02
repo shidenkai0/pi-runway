@@ -5,6 +5,7 @@ import { SandboxManager } from '@anthropic-ai/sandbox-runtime'
 import type { Mode, RunwayConfig } from './config.ts'
 import type { Policy } from './policy.ts'
 import { GrantStore } from './permissions/grants.ts'
+import { TrialCounters } from './trial.ts'
 import { AvailabilityBreaker } from './review/availability.ts'
 import { redactSecrets } from './review/redact.ts'
 import type { Endpoint } from './permissions/operation.ts'
@@ -99,6 +100,8 @@ export class Runtime {
     this.approved.delete(callKey(sessionId, toolCallId))
   }
   readonly stats = { allowed: 0, reviewed: 0, asked: 0, denied: 0 }
+  /** Per-session interruption counts for /runway (counts only, in memory). */
+  readonly tally = new TrialCounters()
   /** Bundled companions and how they loaded (for /runway doctor). */
   companions: import('./companions.ts').CompanionStatus[] = []
   /** Bumped whenever settings change, so cached per-session config reloads. */

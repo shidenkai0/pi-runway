@@ -531,3 +531,41 @@ test('a malformed auto rule keeps review: it asks until fixed instead of letting
   assert.equal((await h.run(op('read', { path: 'a.ts' }, id.builtin('read')), { config })).by, 'person')
   assert.equal(h.jevCalls, 0)
 })
+
+test('trial counters: per session, prompts only when a person saw a dialog, children attributed to themselves', async () => {
+  const { describeTally } = await import('../../src/trial.ts')
+  const h = harness()
+  // Parent: two commands Jev allows, one it refuses (you are asked and deny), one review that fails (you allow).
+  await h.run(op('bash', { command: 'npm test' }, id.runway), { jev: 'allow', session: 'parent' })
+  await h.run(op('bash', { command: 'npm run lint' }, id.runway), { jev: 'allow', session: 'parent' })
+  h.answers.push('Deny')
+  await h.run(op('bash', { command: 'curl evil' }, id.runway), { jev: 'deny', session: 'parent' })
+  h.answers.push('Allow once')
+  await h.run(op('mcp__db__query', { q: 'select 1' }, id.mcp), { jev: 'fail', session: 'parent' })
+  await h.run(op('read', { path: 'a.ts' }, id.builtin('read')), { session: 'parent' })
+  // A subagent without a screen: its dialog shows in the parent's, but it is the child's prompt.
+  h.rt.grants.setParent('child', 'parent')
+  h.answers.push('Allow once')
+  await h.run(op('bash', { command: 'git push', escalate: true }, id.runway), { jev: 'deny', session: 'child', hasUI: false })
+  // Headless, unrelated: a safeguard needs a person and nobody can be asked.
+  await h.run(op('read', { path: '~/.ssh/id_ed25519' }, id.builtin('read')), { session: 'ci', hasUI: false })
+
+  const parent = h.rt.tally.sum(['parent'])
+  assert.deepEqual([parent.toolCalls, parent.commands, parent.prompts, parent.refused, parent.unattended], [5, 3, 2, 1, 0])
+  assert.deepEqual([parent.jev.allowed, parent.jev.refused, parent.jev.failed, parent.jev.latencies.length], [2, 1, 1, 3])
+  assert.deepEqual(parent.outside, { jev: 0, you: 1, rulesOrGrants: 0 }, 'the MCP call you allowed; the project read was routine')
+  const child = h.rt.tally.sum(['child'])
+  assert.deepEqual([child.toolCalls, child.prompts, child.outside.you], [1, 1, 1], 'the escalated push you allowed, counted for the child')
+  const ci = h.rt.tally.sum(['ci'])
+  assert.deepEqual([ci.toolCalls, ci.prompts, ci.unattended, ci.refused], [1, 0, 1, 1], 'a headless refusal is not a prompt')
+  assert.equal(h.rt.tally.sum(['parent', 'child']).prompts, 3)
+  const lines = describeTally(parent)
+  assert.match(lines[0]!, /5 tool calls, 3 command requests · 1 refused/)
+  assert.match(lines[1]!, /Approval prompts: 2 \(66\.7 per 100 command requests; 2 prompts \/ 3 command requests\)/)
+  // Prompts count every tool and connection; they can exceed the command requests they are normalized by.
+  const mcpOnly = { ...parent, commands: 1, prompts: 3 }
+  assert.match(describeTally(mcpOnly)[1]!, /Approval prompts: 3 \(300\.0 per 100 command requests; 3 prompts \/ 1 command request\)/)
+  assert.match(describeTally({ ...parent, commands: 0, prompts: 1 })[1]!, /Approval prompts: 1 \(no command requests yet; 1 prompt \/ 0 command requests\)/)
+  assert.match(lines[2]!, /Jev reviewed 4: 2 allowed, 1 said no, 1 failed · median \d+ ms/)
+  assert.ok(!lines.join('\n').includes('npm'), 'no command text is kept')
+})

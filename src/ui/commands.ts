@@ -12,6 +12,7 @@ import type { Policy } from '../policy.ts'
 import type { LogEntry, Runtime } from '../runtime.ts'
 import { Panel } from './panel.ts'
 import type { PanelKey, PanelResult, PanelSection } from './panel.ts'
+import { describeTally } from '../trial.ts'
 
 // Everything you see of Runway besides approval dialogs: one quiet status
 // item, and /runway for status, permissions, the decision log and a setup check.
@@ -119,8 +120,9 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
     const { config } = deps.configFor(ctx)
     const mode = deps.effectiveMode(config)
     const id = ctx.sessionManager.getSessionId()
-    const s = rt.stats
     const grants = rt.grants.own(id)
+    // Subagent sessions started from this one (at any depth).
+    const children = rt.tally.sessions().filter(s => s !== id && rt.grants.lineage(s).includes(id))
     return [
       {
         title: 'Now',
@@ -131,12 +133,13 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
           { lead: 'Reviewer', text: rt.reviewerKeyPresent ? 'Jev via OpenRouter' : 'none — you are asked instead (set OPENROUTER_API_KEY or /login to OpenRouter)', tone: rt.reviewerKeyPresent ? 'normal' : 'warning' },
         ],
       },
+      { title: 'This session', note: 'counts only, until Pi exits', rows: describeTally(rt.tally.sum([id])).map(text => ({ text, tone: 'muted' as const })) },
+      ...(children.length
+        ? [{ title: 'Its subagents', note: `${children.length} session${children.length === 1 ? '' : 's'}`, rows: describeTally(rt.tally.sum(children)).map(text => ({ text, tone: 'muted' as const })) }]
+        : []),
       {
-        title: 'This Pi process',
-        rows: [
-          { text: `${s.allowed} allowed · ${s.reviewed} reviewed by Jev · ${s.asked} asked you · ${s.denied} blocked`, tone: 'muted' },
-          { text: `${grants.length} approval${grants.length === 1 ? '' : 's'} for this session · ${config.permissions.length} saved rule${config.permissions.length === 1 ? '' : 's'}`, tone: 'muted' },
-        ],
+        title: 'Rules and approvals',
+        rows: [{ text: `${grants.length} approval${grants.length === 1 ? '' : 's'} for this session · ${config.permissions.length} saved rule${config.permissions.length === 1 ? '' : 's'}`, tone: 'muted' }],
       },
       { title: 'Recent decisions', note: 'routine allows are not listed', leadWidth: 11, rows: rt.readLog(6).reverse().map(entryLine), empty: 'nothing yet' },
     ]

@@ -97,7 +97,7 @@ Rules live in `~/.pi/agent/runway.json`. The strongest matching rule wins: **den
 
 [Jev](https://typesafe.ai) (TypeSafe, served through [OpenRouter](https://openrouter.ai)) answers a fixed set of questions about the one call in front of it: does it send sensitive data somewhere, is it destructive, did the user ask for it… Runway turns the answers into allow or no with fixed rules in code, so a persuasive conversation can at most move the answers to individual questions, not rewrite the decision rules. The rules include the policy's own exceptions: a low-risk action the user explicitly told the agent not to do (directly, or in a plan or file they told it to follow) is refused, and an action that might put a secret value into the conversation goes to you to confirm. Approvals are not cached: the same call later is judged again against the conversation as it is then. A call too large to send whole goes to you instead of a truncated review.
 
-**How good is it?** One evaluation, run with `npm run eval`: 147 owner-labelled permission requests from real sessions and curated cases (119 should be allowed, 28 should ask a person), each replayed 3 times through Runway's actual gate on 2026-10-02. They are historical requests, so the reviewer is told that the working folder and some arguments weren't recorded. Current code:
+**How good is it?** One evaluation, run with `npm run eval`: 147 owner-labelled permission requests from real sessions and curated cases (119 should be allowed, 28 should ask a person), each replayed 3 times through Runway's actual gate on 2026-10-02. They are historical requests, so the reviewer is told that the working folder and some arguments weren't recorded. Results with today's questions, composer and rules (the eval runner and replay plumbing have changed since; the inputs are private, so this run was not repeated):
 
 | | Runway's gate (rules + Jev) | Jev's answers alone | Earlier setup (2026-09-22, Jev alone) |
 |---|---|---|---|
@@ -108,7 +108,7 @@ Rules live in `~/.pi/agent/runway.json`. The strongest matching rule wins: **den
 
 What moved the numbers: the policy Jev works from says to allow low- and medium-risk actions except when the user still explicitly prohibits them, but none of the original questions asked that, and the reference composer only *advised* confirming a possible secret disclosure. Runway adds the question (`user_prohibited`) and makes both rules real decisions; thresholds are unchanged. Before that, the same gate allowed 30 of 84 should-ask requests (10 cases, every one composed as "low risk, no rule fired", six of them explicitly forbidden targets) and asked on 36 of 357 should-allow ones. The price of catching more is more questions to you: of the 56, 22 come from Jev's existing prompt-injection signal, 19 from the prohibition question, 3 from secret confirmation and 12 from Runway's built-in safeguards (3 file-tool allows and 18 safeguard asks were settled without Jev; the safeguards are deliberately blunt). Earlier runs on superseded code are kept in `eval/recorded/superseded/`.
 
-So Jev still lets through some requests a careful person would want to see. **That's why the sandbox, not the reviewer, is the main protection:** a wrongly approved ordinary command still runs contained. Calls outside the sandbox (MCP servers, other extensions' tools, `escalate`) rely on the gate alone; for those, your rules or `ask` mode are the stronger choice. These figures come from one labelled suite (147 cases) that also showed where the policy wasn't represented, so treat them as regression evidence, not a guarantee.
+So Jev still lets through some requests a careful person would want to see. **That's why the sandbox, not the reviewer, is the main protection:** a wrongly approved ordinary command still runs contained. Calls outside the sandbox (MCP servers, other extensions' tools, `escalate`) rely on the gate alone; for those, your rules or `ask` mode are the stronger choice. These figures come from one labelled suite (147 cases) that also showed where the policy wasn't represented, so treat them as regression evidence, not a guarantee. The same suite also carries 24 public synthetic cases (12 should-ask / should-allow pairs) anyone can rerun without private data (`npm run eval -- --live --cases public`). On those, current code wrongly allowed 6 of 36 should-ask decisions (2 cases, each 3 of 3; the label of one, P24, is awaiting the owner's ruling) and wrongly asked on 3 of 36 should-allow decisions (1 case). Details in [how it works](docs/how-it-works.md#the-evaluation-eval).
 
 **What Jev sees:** the tool, its actual arguments, how it would run, the agent's stated reason, and an excerpt of the conversation (about 20,000 tokens at most). Text shaped like keys, tokens and passwords is replaced first; this is pattern-based and can miss unusual forms. Your provider keys are never added. Decisions are logged locally in `~/.pi/agent/runway/decisions.jsonl`.
 
@@ -129,7 +129,7 @@ Switch any companion off with `"companions": { "web": false }`.
 |---|---|
 | Status line | `runway · auto` (Jev reviews), `runway · ask` (you review), `runway · off` |
 | `ctrl+shift+a` | switch between auto and ask |
-| `/runway` | mode, sandbox, recent decisions |
+| `/runway` | mode, sandbox, recent decisions, and how many approval prompts this session and its subagents showed you, per 100 command requests |
 | `/runway permissions` | rules and approvals: inspect, add, remove, revoke, reset |
 | `/runway log` | the decisions that needed one, who decided and why |
 | `/runway doctor` | check the setup: sandbox, bash ownership, reviewer key, companions, conflicting packages |
@@ -195,6 +195,6 @@ npm run test:matrix    # real npm/pnpm/bun/pip/uv/cargo/deno/git workflows in th
 npm run check          # typecheck
 ```
 
-`npm run eval -- --live --inputs <pi-auto-review-jev/eval>` reruns the evaluation (paid, and it sends the owner's private session evidence to Jev; ask first). See [docs/how-it-works.md](docs/how-it-works.md) for the design.
+`npm run eval -- --live --cases public` reruns the public synthetic cases (paid). `npm run eval -- --live --inputs <pi-auto-review-jev/eval>` reruns the historical cases (paid, and it sends the owner's private session evidence to Jev; ask first). See [docs/how-it-works.md](docs/how-it-works.md) for the design.
 
 MIT licensed. See [NOTICE](NOTICE) for included work.

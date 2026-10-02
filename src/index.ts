@@ -9,15 +9,14 @@ import { loadConfig } from './config.ts'
 import type { Mode, RunwayConfig } from './config.ts'
 import { gate } from './permissions/gate.ts'
 import type { Verdict } from './permissions/gate.ts'
-import { networkOperation, normalize, parseHostPort } from './permissions/operation.ts'
+import { normalize, parseHostPort } from './permissions/operation.ts'
 import type { Endpoint, Operation, ToolIdentity, ToolMeta } from './permissions/operation.ts'
-import { buildPolicy } from './policy.ts'
-import type { Policy } from './policy.ts'
+import { buildPolicy, policyCache } from './policy.ts'
 import { resolveReviewerKey } from './review/jev.ts'
 import { runtime } from './runtime.ts'
 import type { Runtime } from './runtime.ts'
 import { refreshStatus, registerUi } from './ui/commands.ts'
-import { backgroundVerdict, connectionVerdict } from './network.ts'
+import { createNetworkAsk } from './network.ts'
 import { GUARDED_SEARCH_TOOLS, guardedSearchTools } from './search.ts'
 import { registerWorktree } from './worktree.ts'
 
@@ -94,14 +93,8 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
     return state
   }
 
-  const policyCache = new Map<string, { at: number; policy: Policy }>()
-  const policyFor = (cwd: string, config: RunwayConfig): Policy => {
-    const cached = policyCache.get(cwd)
-    if (cached && Date.now() - cached.at < 5_000) return cached.policy
-    const policy = buildPolicy(cwd, config, rt.agentDir)
-    policyCache.set(cwd, { at: Date.now(), policy })
-    return policy
-  }
+  // Per folder and settings object (replaced when settings change), so new settings apply at once.
+  const policyFor = policyCache((cwd, config) => buildPolicy(cwd, config, rt.agentDir))
 
   // ---------- companions (before our gate, so e.g. plan mode can refuse edits first) ----------
 
@@ -245,50 +238,15 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
   // The proxy only knows host and port, not which running command opened the
   // connection, so it's allowed only if every command running at that moment
   // may reach that host:port on its own.
-  const pendingNetwork = new Map<string, Promise<boolean>>()
-  const decisions = new WeakMap<object, Map<string, boolean>>()
-  const mayConnect = async (id: string, host: string, port: number | undefined): Promise<boolean> => {
-    const r = rt.running.get(id)
-    if (!r) return true // finished meanwhile: it isn't the requester
-    const session = rt.sessions.get(r.sessionId)
-    if (!session) return false
-    const { config } = configFor(session.ctx)
-    if (effectiveMode(rt, config) === 'off') return true
-    const op = networkOperation(host, port, r.cwd, [r.command])
-    const verdict0 = connectionVerdict(op, config, policyFor(r.cwd, config), r.endpoints)
-    if (verdict0 !== 'gate') return verdict0 === 'allow'
-    // Decided once per running command and host:port; "for this session" is a grant the gate keeps.
-    const decided = decisions.get(r) ?? new Map<string, boolean>()
-    decisions.set(r, decided)
-    const key = `${host}:${port ?? ''}`
-    const earlier = decided.get(key)
-    if (earlier !== undefined) return earlier
-    const verdict = await decide(op, session.ctx)
-    decided.set(key, verdict.allow)
-    return verdict.allow
-  }
-  rt.networkAsk = async (host, port) => {
-    const ids = [...rt.running.keys()]
-    if (ids.length === 0) {
-      // Something an earlier command left running. Nobody can be asked on its
-      // behalf: only what every open session would let through without asking.
-      return rt.sessions.size > 0 && [...rt.sessions.values()].every(s => {
-        const { config } = configFor(s.ctx)
-        if (effectiveMode(rt, config) === 'off') return true
-        return backgroundVerdict(networkOperation(host, port, s.ctx.cwd, []), config, policyFor(s.ctx.cwd, config))
-      })
-    }
-    for (const id of ids) {
-      const k = `${id}|${host}:${port ?? ''}`
-      let pending = pendingNetwork.get(k)
-      if (!pending) {
-        pending = mayConnect(id, host, port).finally(() => pendingNetwork.delete(k))
-        pendingNetwork.set(k, pending)
-      }
-      if (!(await pending)) return false
-    }
-    return true
-  }
+  rt.networkAsk = createNetworkAsk({
+    rt,
+    settingsFor: ctx => {
+      const { config } = configFor(ctx)
+      return { config, off: effectiveMode(rt, config) === 'off' }
+    },
+    policyFor,
+    review: async (op, ctx) => (await decide(op, ctx)).allow,
+  })
 
   // ---------- sessions and subagents ----------
 

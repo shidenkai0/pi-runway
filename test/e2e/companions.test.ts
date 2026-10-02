@@ -275,6 +275,44 @@ test('g. after a child finishes, a second child runs and dialogs are still attri
   }
 })
 
+// ---------- h. trial counters ----------
+
+test('h. /runway counts this session and its subagents; prompts have their denominator; a new session starts at zero', async () => {
+  const h = makeHome(server, { models: ['fake-model', 'fake-small'] })
+  try {
+    writeAgent(h, 'worker')
+    server.setJev(state => ({ allow: !commandOf(state).includes('needs-person') }))
+    server.setScript(family([
+      { tool: 'bash', args: { command: 'echo one' } },
+      { tool: 'bash', args: { command: 'echo needs-person-parent' } },
+      spawn('CHILD TASK H'),
+    ], {
+      'CHILD TASK H': [
+        { tool: 'bash', args: { command: 'echo child-one' } },
+        { tool: 'bash', args: { command: 'echo needs-person-child' } },
+      ],
+    }))
+    const dialogs: PiEvent[] = []
+    const r = await runRpc(h, ['go', '/runway', { rpc: { type: 'new_session' } }, '/runway'], answering(dialogs, () => 'Allow once'), TOOL_TIMEOUT)
+    const [first, second] = notices(r.events).filter(n => n.startsWith('Runway\n'))
+    assert.ok(first && second, notices(r.events).join('\n---\n'))
+    const section = (text: string, title: string) => text.split('\n\n').find(b => b.startsWith(title)) ?? ''
+    const own = section(first, 'This session')
+    assert.match(own, /3 tool calls, 2 command requests · 0 refused/, own)
+    assert.match(own, /Approval prompts: 1 \(50\.0 per 100 command requests; 1 prompt \/ 2 command requests\)/)
+    assert.match(own, /Jev reviewed 3: 2 allowed, 1 said no, 0 failed/, 'two commands and starting the subagent')
+    const kids = section(first, 'Its subagents')
+    assert.match(kids, /1 session/)
+    assert.match(kids, /2 tool calls, 2 command requests/)
+    assert.match(kids, /Approval prompts: 1 \(50\.0 per 100 command requests; 1 prompt \/ 2 command requests\)/, "the child's prompt, shown in the parent's screen, is the child's")
+    assert.ok(!`${own}${kids}`.includes('needs-person'), 'the counters keep no command text (the local decision log below them is separate)')
+    assert.match(section(second, 'This session'), /0 tool calls, 0 command requests/, 'a new session starts at zero')
+    assert.doesNotMatch(second, /Its subagents/)
+  } finally {
+    h.cleanup()
+  }
+})
+
 // ---------- d. the user's own copy wins ----------
 
 test("d. duplicate detection: with the user's own pi-subagents listed, Runway skips its copy; one subagent tool, no conflict", async () => {

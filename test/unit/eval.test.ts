@@ -2,13 +2,15 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { loadBaseline, score, validateRun, validateSuite } from '../../eval/run.ts'
+import { fingerprintParts, loadBaseline, preparePublic, score, summary, validateRun, validateSuite } from '../../eval/run.ts'
+import { DEFAULT_CONFIG } from '../../src/config.ts'
+import type { RunwayConfig } from '../../src/config.ts'
 import type { Row, RunMetadata } from '../../eval/run.ts'
 
 // The eval never counts a malformed, missing or failed row as a decision.
 
 const root = join(import.meta.dirname, '..', '..')
-const suite = JSON.parse(readFileSync(join(root, 'eval', 'cases.json'), 'utf8')) as { cases: { id: string; expected: 'allow' | 'deny' }[] }
+const suite = JSON.parse(readFileSync(join(root, 'eval', 'cases.json'), 'utf8')) as { cases: { id: string; expected: 'allow' | 'deny' }[]; publicCases: { id: string; expected: 'allow' | 'deny'; pair: string; role: string; call: { tool: string }; transcript: { source: string }[] }[] }
 const fp = 'a'.repeat(64)
 const meta: RunMetadata = { type: 'metadata', fingerprint: fp, parts: {}, model: 'typesafe/jev-1.13', repeats: 3, cases: suite.cases.length, started: '2026-10-02T00:00:00Z' }
 const ok = (caseId: string, expected: 'allow' | 'deny', repeat = 0, outcome: 'allow' | 'deny' = expected): Row => ({
@@ -55,4 +57,45 @@ test('the suite and the September baseline are validated like the original eval'
   assert.throws(() => loadBaseline(lines.slice(0, -1)), /incomplete/)
   assert.throws(() => loadBaseline([lines[0], ...lines.slice(1).map((r: Record<string, unknown>, i: number) => (i === 0 ? { ...r, repeat: 7 } : r))]), /invalid row/)
   assert.throws(() => loadBaseline([{ ...lines[0], sourceSha256: 'x' }, ...lines.slice(1)]), /metadata/)
+})
+
+test('public cases live in the same manifest, apart from the 147 historical ones, which are unchanged', () => {
+  assert.equal(suite.cases.length, 147)
+  assert.ok(suite.publicCases.length >= 12)
+  for (const pair of new Set(suite.publicCases.map(c => c.pair))) {
+    const members = suite.publicCases.filter(c => c.pair === pair)
+    assert.deepEqual([...new Set(members.map(c => c.expected))].sort(), ['allow', 'deny'], `${pair} pairs a should-ask with a should-allow`)
+  }
+  assert.ok(suite.publicCases.every(c => c.transcript.some(e => e.source === 'user')), 'every case has user evidence')
+  // The historical labels hash still equals the one the recorded run was made with: only code changed since.
+  const s = summary()
+  assert.ok(!(s.runway!['changed since this run'] as string[]).includes('labels'))
+  assert.equal(s.baseline['allow when ask'], '40/84')
+  const historical = fingerprintParts({ ...DEFAULT_CONFIG, mode: 'auto', onDeny: 'block' } as RunwayConfig, {}, 'historical')
+  const pub = fingerprintParts({ ...DEFAULT_CONFIG, mode: 'auto', onDeny: 'block' } as RunwayConfig, {}, 'public')
+  assert.notEqual(historical.labels, pub.labels)
+  assert.equal(historical.code, pub.code)
+})
+
+test('a public case becomes the call Runway would gate, with its own working folder and attributed conversation', () => {
+  const c = (suite.publicCases as never[]).find((x: { id: string }) => x.id === 'P07')!
+  const p = preparePublic(c)
+  assert.equal(p.op.kind, 'shell')
+  assert.equal(p.cwd, '/work/acme-wt-login')
+  assert.equal(p.recordedRequest, undefined)
+  assert.deepEqual(p.notRecorded, [])
+  assert.deepEqual((p.transcript as { source: string; index: number }[]).map(e => [e.index, e.source]), [[0, 'user'], [1, 'tool']])
+})
+
+test('public runs are validated and scored against public labels only; missing and failed rows stay out', () => {
+  const pubMeta: RunMetadata = { ...meta, selection: 'public', cases: suite.publicCases.length }
+  const [pa, pd] = [suite.publicCases.find(c => c.expected === 'allow')!, suite.publicCases.find(c => c.expected === 'deny')!]
+  const run = validateRun([pubMeta, ok(pa.id, 'allow'), ok(pd.id, 'deny', 0, 'allow'), { caseId: pd.id, repeat: 1, expected: 'deny', gate: 'error', settledBy: 'reviewer-failed', fingerprint: fp, reviewer: { status: 'ERROR', failure: 'timeout', latencyMs: 8000 } }], 'p')
+  const s = score(run.rows, 'public')
+  assert.equal(s.planned, suite.publicCases.length * 3)
+  assert.equal(s.missing, suite.publicCases.length * 3 - 3)
+  assert.equal(s.gate['allow when ask'], '1/1')
+  assert.equal(s.gate.errors, 1)
+  assert.throws(() => validateRun([pubMeta, ok(a.id, a.expected)], 'p'), /invalid row/, 'a historical id in a public run')
+  assert.throws(() => validateRun([meta, ok(pa.id, 'allow')], 'h'), /invalid row/, 'a public id in a historical run')
 })
