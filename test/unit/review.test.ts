@@ -167,3 +167,20 @@ test('production asks about restrictions by scope and reach (the evaluated wordi
   const q = QUESTION_SET.user_prohibited.instructions
   for (const part of ['forbid an action or a target', 'limit the work to a scope', 'exclude a place', 'walks a folder recursively', 'names specific files or folders reaches only those', 'still in effect']) assert.ok(q.includes(part), part)
 })
+
+test('candidate reviewers are reproducible: built from the f281f0c question snapshot, each changing only what it tests', async () => {
+  const { VARIANTS, QUESTIONS_F281 } = await import('../../eval/variants.ts')
+  const { PRODUCTION_REVIEWER } = await import('../../src/review/reviewer.ts')
+  const changed = (name: string) => Object.keys(VARIANTS[name]!.questions).filter(k => JSON.stringify(VARIANTS[name]!.questions[k]) !== JSON.stringify(QUESTIONS_F281[k]))
+  assert.deepEqual(changed('production-f281f0c'), [])
+  assert.equal(VARIANTS['production-f281f0c']!.policy, PRODUCTION_REVIEWER.policy)
+  assert.deepEqual(changed('task-relevance'), ['task_related'])
+  assert.deepEqual(changed('instruction-provenance'), ['untrusted_instructed'])
+  assert.deepEqual(changed('recoverability'), ['destructive'])
+  assert.deepEqual(changed('authorization-semantics'), ['authorization'])
+  assert.deepEqual(changed('compact-state-current'), [])
+  assert.notEqual(VARIANTS['compact-state-current']!.policy, PRODUCTION_REVIEWER.policy)
+  assert.deepEqual(changed('pre-scope'), ['user_prohibited'])
+  // While production is unchanged, the snapshot is exactly production's question set.
+  assert.equal(JSON.stringify(QUESTIONS_F281), JSON.stringify(QUESTION_SET))
+})
