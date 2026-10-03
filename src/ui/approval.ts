@@ -60,7 +60,7 @@ function mainOptions(req: ApprovalRequest): Option[] {
     { label: `Allow for this session: ${req.sessionOpLabel}`, choice: { kind: 'session-op' } },
   ]
   if (req.sessionToolLabel) opts.push({ label: req.sessionToolLabel, choice: { kind: 'session-tool' }, tone: 'warning' })
-  if (req.saveScopes.length) opts.push({ label: 'Always allow…', hint: 'save a rule', step: 'save' })
+  if (req.saveScopes.length) opts.push({ label: 'Always allow… (save a rule)', step: 'save' })
   opts.push({ label: 'Deny', choice: { kind: 'deny' } })
   opts.push({ label: 'Deny and tell the agent why…', step: 'reason' })
   return opts
@@ -201,7 +201,7 @@ export class ApprovalDialog implements Component, Focusable {
     if (budget - l.fixed < 2) l = layout(true)
     const room = Math.max(1, Math.min(12, budget - l.fixed))
     this.actionClipped = actionLines.length > room || l.capWhy !== why || l.capRuns !== runs
-    const keep = Math.max(1, room - 1)
+    const keep = Math.max(0, room - 1)
     const shown = actionLines.length > room ? [...actionLines.slice(0, keep), clip('   ', t.fg('dim', `… ${actionLines.length - keep} more lines · v to see all`), w)] : actionLines
     // The most useful keys come first, so the ones that don't fit are the least needed.
     const hints = hintLines(this.hintParts(), w).slice(0, l.gap.length ? 2 : 1)

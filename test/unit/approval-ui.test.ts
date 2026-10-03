@@ -22,6 +22,38 @@ const request = (over: Partial<ApprovalRequest> = {}): ApprovalRequest => ({
   ...over,
 })
 
+const savedScope = {
+  label: 'This exact command, in any project',
+  rule: { action: 'allow' as const, tool: 'bash', command: 'npm test' },
+  broad: false,
+}
+
+test('main choices stay in place while navigating, including Always allow', () => {
+  for (const width of [100, 80, 40, 20]) for (const rows of [40, 24, 18, 12]) {
+    const d = new ApprovalDialog(request({ saveScopes: [savedScope], focusDeny: false }), theme, () => {}, () => rows)
+    const layout = () => plain(d.render(width)).map(line => line.replace(/→ (?=[1-9] )/, '  '))
+    const first = layout()
+    for (let i = 0; i < 6; i++) {
+      assert.deepEqual(layout(), first, `${width}x${rows}: choice ${i + 1} changes only the highlight`)
+      assert.ok(d.render(width).length < rows, `${width}x${rows}: choices still fit`)
+      d.handleInput('j')
+    }
+  }
+})
+
+test('Always allow explains saving inline and still previews the exact rule before saving', () => {
+  const choices: ApprovalChoice[] = []
+  const d = new ApprovalDialog(request({ saveScopes: [savedScope] }), theme, c => choices.push(c))
+  const main = plain(d.render(100))
+  assert.ok(main.some(line => line.includes('Always allow… (save a rule)')))
+  assert.ok(!main.some(line => line.trim() === 'save a rule'), 'no selection-only helper row')
+  d.handleInput('4')
+  assert.deepEqual(choices, [], 'entering the rule picker approves nothing')
+  assert.match(plain(d.render(100)).join('\n'), /allow bash · command "npm test"/)
+  d.handleInput('1')
+  assert.deepEqual(choices, [{ kind: 'save', scope: savedScope }])
+})
+
 test('the dialog fits the terminal: decisions stay visible however long the action is', () => {
   for (const width of [100, 80, 40, 20]) for (const rows of [40, 24, 18, 12]) {
     const lines = new ApprovalDialog(request(), theme, () => {}, () => rows).render(width)
