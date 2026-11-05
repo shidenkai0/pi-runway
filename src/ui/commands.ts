@@ -35,8 +35,10 @@ export function refreshStatus(ctx: ExtensionContext, rt: Runtime, mode: Mode, pr
   if (!ctx.hasUI) return
   let plain: string
   let color: 'accent' | 'error' | 'warning' | 'success'
-  if (progress) [plain, color] = [`runway · ${progress}`, 'accent']
+  const sandboxOff = !rt.sandboxEnabled(ctx.sessionManager.getSessionId())
+  if (progress) [plain, color] = [`runway · ${progress}${sandboxOff && mode !== 'off' ? ' · sandbox off' : ''}`, sandboxOff ? 'warning' : 'accent']
   else if (mode === 'off') [plain, color] = ['runway · off', 'error']
+  else if (sandboxOff) [plain, color] = [`runway · ${mode} · sandbox off · reviewed`, 'warning']
   else if (rt.sandboxState !== 'ready') [plain, color] = [`runway · ${mode} · no sandbox`, 'warning']
   else [plain, color] = [`runway · ${mode}`, mode === 'auto' ? 'success' : 'accent']
   let text = plain
@@ -109,7 +111,7 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
   const setMode = (ctx: ExtensionContext, mode: Mode) => {
     rt.modeOverride = mode
     const { config } = deps.configFor(ctx)
-    if (mode !== 'off' && rt.sandboxState !== 'ready') void rt.ensureSandbox(config, deps.policyFor(ctx.cwd, config)).then(() => refreshStatus(ctx, rt, mode))
+    if (mode !== 'off' && rt.sandboxEnabled(ctx.sessionManager.getSessionId()) && rt.sandboxState !== 'ready') void rt.ensureSandbox(config, deps.policyFor(ctx.cwd, config)).then(() => refreshStatus(ctx, rt, mode))
     refreshStatus(ctx, rt, mode)
     ctx.ui.notify(`Runway ${MODE_TEXT[mode]}`, mode === 'off' ? 'warning' : 'info')
   }
@@ -121,6 +123,7 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
     const mode = deps.effectiveMode(config)
     const id = ctx.sessionManager.getSessionId()
     const grants = rt.grants.own(id)
+    const contained = mode !== 'off' && rt.sandboxEnabled(id)
     // Subagent sessions started from this one (at any depth).
     const children = rt.tally.sessions().filter(s => s !== id && rt.grants.lineage(s).includes(id))
     return [
@@ -129,7 +132,7 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
         leadWidth: 9,
         rows: [
           { lead: 'Mode', text: MODE_TEXT[mode], tone: mode === 'off' ? 'danger' : 'normal' },
-          { lead: 'Sandbox', text: rt.sandboxState === 'ready' ? `on (${process.platform === 'darwin' ? 'macOS Seatbelt' : 'Linux bubblewrap'}) · network ${config.network}` : `not running${rt.sandboxError ? ` — ${rt.sandboxError}` : ''}`, tone: rt.sandboxState === 'ready' ? 'normal' : 'warning' },
+          { lead: 'Sandbox', text: !contained ? `off for this session${mode !== 'off' ? ' · tool-call review stays on' : ' · reviews also off'}` : rt.sandboxState === 'ready' ? `on (${process.platform === 'darwin' ? 'macOS Seatbelt' : 'Linux bubblewrap'}) · network ${config.network}` : `not running${rt.sandboxError ? ` — ${rt.sandboxError}` : ''}`, tone: contained && rt.sandboxState === 'ready' ? 'normal' : 'warning' },
           { lead: 'Reviewer', text: rt.reviewerKeyPresent ? 'Jev via OpenRouter' : 'none — you are asked instead (set OPENROUTER_API_KEY or /login to OpenRouter)', tone: rt.reviewerKeyPresent ? 'normal' : 'warning' },
         ],
       },
@@ -177,8 +180,9 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
     const policy = deps.policyFor(ctx.cwd, config)
     const ok = (good: boolean, warn = false) => (good ? 'success' : warn ? 'warning' : 'danger') as 'success' | 'warning' | 'danger'
     const bash = deps.identityOf('bash')
+    const contained = deps.effectiveMode(config) !== 'off' && rt.sandboxEnabled(ctx.sessionManager.getSessionId())
     const rows = [
-      { text: `${rt.sandboxState === 'ready' ? '✓' : '✗'} Sandbox ${rt.sandboxState === 'ready' ? 'ready' : 'not running'}`, detail: rt.sandboxError, tone: ok(rt.sandboxState === 'ready') },
+      { text: !contained ? '! Sandbox off for this session' : `${rt.sandboxState === 'ready' ? '✓' : '✗'} Sandbox ${rt.sandboxState === 'ready' ? 'ready' : 'not running'}`, detail: !contained ? 'No OS isolation for future commands. /runway sandbox on restores it; already-running commands are unchanged.' : rt.sandboxError, tone: !contained ? 'warning' as const : ok(rt.sandboxState === 'ready') },
       { text: `${bash.kind === 'runway' ? '✓' : '✗'} ${bash.kind === 'runway' ? 'Runway runs the bash tool' : 'Another extension replaced the bash tool'}`, detail: bash.kind === 'runway' ? undefined : `Commands from it are reviewed but not sandboxed by Runway${bash.kind === 'extension' ? ` (${short(bash.path)})` : ''}. Remove the other bash extension.`, tone: ok(bash.kind === 'runway') },
       { text: `${rt.reviewerKeyPresent ? '✓' : '!'} ${rt.reviewerKeyPresent ? 'Reviewer key found (Jev via OpenRouter)' : 'No reviewer key: you are asked instead of Jev'}`, detail: rt.reviewerKeyPresent ? undefined : 'Set OPENROUTER_API_KEY, or /login to OpenRouter, then restart Pi.', tone: ok(rt.reviewerKeyPresent, true) },
       ...deps.companions().map(c => ({
@@ -215,6 +219,32 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
   }
 
   // ---------- flows ----------
+
+  const sandboxCommand = async (ctx: ExtensionContext, action?: string): Promise<void> => {
+    const { config } = deps.configFor(ctx)
+    const mode = deps.effectiveMode(config)
+    const id = ctx.sessionManager.getSessionId()
+    if (action !== 'on' && action !== 'off') {
+      ctx.ui.notify(`Sandbox ${mode !== 'off' && rt.sandboxEnabled(id) ? 'on' : 'off'}. /runway sandbox on | off. This changes future commands in this session and its subagents, not saved settings or already-running commands.`, 'info')
+      return
+    }
+    if (mode === 'off') {
+      ctx.ui.notify('Runway review is off. Choose /runway auto or /runway ask first, then change the sandbox independently.', 'warning')
+      return
+    }
+    const enabled = action === 'on'
+    if (enabled === rt.sandboxEnabled(id) && (!enabled || rt.sandboxReady())) {
+      ctx.ui.notify(`Sandbox already ${action}. Tool-call review stays on.`, 'info')
+      return
+    }
+    if (!enabled && !await ctx.ui.confirm('Turn the sandbox off for this session?', 'Future commands in this session and its subagents will have your filesystem and network access.\n\nYour rules and Jev/person review stay on. This does not authorize new targets or actions.\n\nNo saved settings change. /runway sandbox on restores isolation for future commands; already-running commands are unchanged.')) return
+    rt.sandboxOverrides.set(id, enabled)
+    if (enabled) await rt.ensureSandbox(config, deps.policyFor(ctx.cwd, config))
+    refreshStatus(ctx, rt, mode)
+    ctx.ui.notify(enabled
+      ? rt.sandboxReady() ? 'Sandbox on for future commands. Tool-call review stays on.' : `Sandbox requested, but could not start (${rt.sandboxError ?? 'unknown error'}). Contained commands remain blocked.`
+      : 'Sandbox off for this session and its subagents. Tool-call review stays on. /runway sandbox on to restore containment.', enabled && rt.sandboxReady() ? 'info' : 'warning')
+  }
 
   const addRule = async (ctx: ExtensionContext): Promise<void> => {
     const actionLabel = await ctx.ui.select('New rule — what should happen?', ACTIONS.map(a => ACTION_WORDS[a]))
@@ -313,14 +343,15 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
   }
 
   pi.registerCommand('runway', {
-    description: 'Runway: status · permissions · log · doctor · auto | ask | off',
+    description: 'Runway: status · permissions · sandbox on | off · log · doctor · auto | ask | off',
     getArgumentCompletions: prefix =>
-      ['status', 'permissions', 'log', 'doctor', 'auto', 'ask', 'off']
+      ['status', 'permissions', 'sandbox', 'sandbox on', 'sandbox off', 'log', 'doctor', 'auto', 'ask', 'off']
         .filter(item => item.startsWith(prefix.trim()))
         .map(item => ({ value: item, label: item })),
     handler: async (raw: string, ctx: ExtensionCommandContext) => {
       const args = raw.trim().split(/\s+/).filter(Boolean)
       const [sub = 'status', ...rest] = args
+      if (sub === 'sandbox') return sandboxCommand(ctx, rest[0])
       if (sub === 'auto' || sub === 'ask') return setMode(ctx, sub)
       if (sub === 'off') {
         if (await ctx.ui.confirm('Turn Runway off?', 'Commands will run without the sandbox and without any review — with your full access — until you turn it back on or restart Pi.')) setMode(ctx, 'off')
@@ -347,10 +378,12 @@ export function registerUi(pi: ExtensionAPI, rt: Runtime, deps: UiDeps): void {
         { key: 'l', label: 'log' },
         { key: 'd', label: 'doctor' },
         { key: 'm', label: 'switch auto/ask' },
+        { key: 's', label: rt.sandboxEnabled(ctx.sessionManager.getSessionId()) ? 'sandbox off…' : 'sandbox on' },
       ], done))
       if (!result) return
       if (result.key === 'p') return permissionsCommand(ctx, [])
       if (result.key === 'm') return setMode(ctx, deps.effectiveMode(deps.configFor(ctx).config) === 'auto' ? 'ask' : 'auto')
+      if (result.key === 's') return sandboxCommand(ctx, rt.sandboxEnabled(ctx.sessionManager.getSessionId()) ? 'off' : 'on')
       const next = result.key === 'l' ? 'log' : 'doctor'
       const sectionsNext = next === 'log' ? [{ title: 'Last 30 decisions', note: 'routine allows are not logged', leadWidth: 11, rows: rt.readLog(30).reverse().map(entryLine), empty: 'nothing yet' }] : doctorSections(ctx)
       await openPanel(ctx, (done, theme) => new Panel(theme, next === 'log' ? 'Runway log' : 'Runway doctor', undefined, sectionsNext, [], done))

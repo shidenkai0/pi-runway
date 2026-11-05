@@ -79,6 +79,10 @@ function approvedEndpoints(op: Operation, verdict: Verdict): Endpoint[] {
 export default async function runway(pi: ExtensionAPI): Promise<void> {
   const rt = runtime()
   rt.agentDir = getAgentDir()
+  pi.registerFlag('no-sandbox', {
+    type: 'boolean', default: false,
+    description: 'Run commands outside the sandbox for this Pi process; Runway rules and Jev/person review remain on.',
+  })
   const sessionState = new Map<string, SessionState>()
   const companionOwners = new Map<string, CompanionId>()
   let companions: CompanionStatus[] = []
@@ -160,6 +164,7 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
     const op = normalize({
       tool: event.toolName, input, cwd: ctx.cwd, toolCallId: event.toolCallId,
       parentToolCallId: (event as { parentToolCallId?: string }).parentToolCallId, meta: metaFor(event.toolName),
+      sandboxDisabled: !rt.sandboxEnabled(ctx.sessionManager.getSessionId()),
     })
     const verdict = await decide(op, ctx, ctx.signal)
     if (!verdict.allow) return { block: true, reason: verdict.message ?? 'Blocked by Runway.' }
@@ -184,17 +189,17 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
       write: Type.Optional(Type.Array(Type.String(), { description: 'Extra folders this command must write to, outside the project (e.g. a sibling repository).' })),
       hosts: Type.Optional(Type.Array(Type.String(), { description: 'Extra network hosts this command must reach (e.g. "api.example.com").' })),
     }, { description: 'Ask for specific extra sandbox access for this one command. The request is reviewed.' })),
-    escalate: Type.Optional(Type.Boolean({ description: 'Run outside the sandbox with the user\'s full access. Only for things the sandbox cannot do even with `access` (stored credentials, Keychain, Docker). The request is reviewed.' })),
+    escalate: Type.Optional(Type.Boolean({ description: 'Run outside the sandbox with the user\'s full access. Only for things the sandbox cannot do even with `access` (direct UDP networking, stored credentials, Keychain, Docker). The request is reviewed.' })),
     justification: Type.Optional(Type.String({ description: 'With access or escalate: one sentence on why this command needs it.' })),
   })
 
   pi.registerTool({
     ...template,
     label: 'bash',
-    description: `${template.description} Commands run in a sandbox: the project and temp/cache folders are writable, credential stores are not readable, secret environment variables are removed, and only known package/code hosts are reachable (others are reviewed).`,
+    description: `${template.description} Runway checks every command. By default commands run in a sandbox: the project and temp/cache folders are writable, credential stores are not readable, secret environment variables are removed, and only known package/code hosts are reachable (others are reviewed). The current runway_execution section says whether the user has turned command isolation off for this session.`,
     promptGuidelines: [
       ...(template.promptGuidelines ?? []),
-      'bash runs inside a sandbox and every command is reviewed. If a command fails with <sandbox_violations>, first prefer a way inside the project. If it truly needs more, re-run with "access" (specific extra write folders or hosts) and a one-sentence "justification"; only use "escalate": true when it must run with the user\'s full access (stored credentials, Keychain, Docker).',
+      'Every bash command passes Runway review. With the sandbox on, prefer "access" for specific extra write folders or hosts; use "escalate": true and a justification when the operation needs access the sandbox cannot provide (direct UDP networking, stored credentials, Keychain, Docker). Before retrying a failed command, check for partially completed effects; do not blindly repeat a compound command. Turning the sandbox off does not authorize new targets or actions beyond the user\'s task.',
     ],
     parameters,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -204,7 +209,7 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
       const plain = { command, timeout }
       if (mode === 'off') return createBashToolDefinition(ctx.cwd).execute(toolCallId, plain, signal, onUpdate, ctx)
       const sessionId = ctx.sessionManager.getSessionId()
-      const op = normalize({ tool: 'bash', input: params as Record<string, unknown>, cwd: ctx.cwd, toolCallId, meta: metaFor('bash') })
+      const op = normalize({ tool: 'bash', input: params as Record<string, unknown>, cwd: ctx.cwd, toolCallId, meta: metaFor('bash'), sandboxDisabled: !rt.sandboxEnabled(sessionId) })
       let approved = rt.takeApproval(sessionId, toolCallId, op.key)
       if (!approved) {
         // The gate's decision was for different arguments (or none was recorded): decide again.
@@ -228,7 +233,7 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
   // `!` commands are typed by you; they run as you typed them unless you ask for the sandbox.
   pi.on('user_bash', (_event, ctx) => {
     const { config } = configFor(ctx)
-    if (!config.sandboxUserCommands || effectiveMode(rt, config) === 'off' || !rt.sandboxReady()) return undefined
+    if (!config.sandboxUserCommands || effectiveMode(rt, config) === 'off' || !rt.sandboxEnabled(ctx.sessionManager.getSessionId()) || !rt.sandboxReady()) return undefined
     return { operations: sandboxedOperations(rt, `user-${Date.now()}`, ctx, cwd => policyFor(cwd, config), config.keepEnv) }
   })
 
@@ -249,6 +254,15 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
   })
 
   // ---------- sessions and subagents ----------
+
+  pi.on('before_agent_start', (event, ctx) => {
+    const mode = effectiveMode(rt, configFor(ctx).config)
+    event.systemPromptOptions.sections.runway_execution = mode === 'off'
+      ? 'Runway is off: neither its tool-call review nor its command sandbox is active.'
+      : rt.sandboxEnabled(ctx.sessionManager.getSessionId())
+        ? 'Runway sandbox is ON. Bash commands are reviewed and run contained unless an explicit escalation is approved.'
+        : 'Runway sandbox is OFF for this session. Bash commands run directly, but every tool call still passes Runway rules and review. Do not claim sandbox protection; task scope and user restrictions still apply.'
+  })
 
   const pendingNames = new Map<string, string[]>()
   pi.events.on('subagents:child:spawning', (data: unknown) => {
@@ -271,6 +285,7 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
     // A child session may be disposed without a shutdown event.
     rt.sessions.delete(e.sessionId)
     rt.grants.reset(e.sessionId)
+    rt.sandboxOverrides.delete(e.sessionId)
     rt.agentNames.delete(e.sessionId)
     sessionState.delete(e.sessionId)
     void rt.releaseIfIdle()
@@ -283,6 +298,7 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
     rt.sessionsStarted = true
     sessionState.delete(id)
     const { config, problems } = configFor(ctx)
+    if (pi.getFlag('no-sandbox') === true) rt.sandboxDefaultEnabled = false
     rt.reviewerKeyPresent = Boolean(await resolveReviewerKey(config.reviewer.route, ctx.modelRegistry ?? {}, process.env, rt.agentDir))
     try {
       verifyCompanions(companions, listedPackages(rt.agentDir, ctx.cwd, safeTrusted(ctx)), [...pi.getAllTools(), ...pi.getCommands()])
@@ -290,17 +306,20 @@ export default async function runway(pi: ExtensionAPI): Promise<void> {
       // registry not readable: doctor shows the load-time state
     }
     const mode = effectiveMode(rt, config)
-    if (mode !== 'off') await rt.ensureSandbox(config, policyFor(ctx.cwd, config))
+    const contained = rt.sandboxEnabled(id)
+    if (mode !== 'off' && contained) await rt.ensureSandbox(config, policyFor(ctx.cwd, config))
     // Without a screen (pi -p, CI) settings problems go to stderr, so a broken rule is never silent.
     if (!ctx.hasUI && !rt.grants.parentOf(id)) for (const problem of problems) process.stderr.write(`Runway settings: ${problem}\n`)
     if (ctx.hasUI && !rt.grants.parentOf(id)) {
       for (const problem of problems) ctx.ui.notify(`Runway settings: ${problem}`, 'warning')
-      if (mode !== 'off' && rt.sandboxState !== 'ready') ctx.ui.notify(`Runway: the sandbox did not start (${rt.sandboxError ?? 'unknown error'}). Commands won't run until it does, unless one is approved to run outside it.`, 'warning')
+      if (mode !== 'off' && !contained) ctx.ui.notify('Runway: sandbox off — commands have your filesystem and network access. Rules and tool-call review remain on. /runway sandbox on restores containment for future commands.', 'warning')
+      if (mode !== 'off' && contained && rt.sandboxState !== 'ready') ctx.ui.notify(`Runway: the sandbox did not start (${rt.sandboxError ?? 'unknown error'}). Commands won't run until it does, unless one is approved to run outside it.`, 'warning')
       if ((event as { reason?: string }).reason === 'startup' && !rt.reviewerKeyPresent) ctx.ui.notify('Runway: no reviewer key, so you will be asked instead of Jev. Set OPENROUTER_API_KEY or /login to OpenRouter.', 'info')
       for (const c of companions.filter(c => c.state === 'failed')) ctx.ui.notify(`Runway: bundled ${c.label.toLowerCase()} did not load (${c.detail})`, 'warning')
       for (const c of companions.filter(c => c.state === 'inactive')) ctx.ui.notify(`Runway: ${c.label.toLowerCase()} is off — your ${c.pkg} is listed in Pi settings but not loaded. /runway doctor`, 'warning')
       refreshStatus(ctx, rt, mode)
     }
+    if (!ctx.hasUI && !rt.grants.parentOf(id) && mode !== 'off' && !contained) process.stderr.write('Runway: sandbox off; tool-call review remains on.\n')
   })
 
   pi.on('session_shutdown', async (_event, ctx) => {

@@ -40,9 +40,19 @@ function commandEnv(env: NodeJS.ProcessEnv, keepEnv: readonly string[]): NodeJS.
 const VIOLATION_LINE = /(file-write|file-read|network-outbound|deny network|deny\(1\) (file|network)|not on the allow list|denied by|user denied|permission prompt failed)/
 
 export const SANDBOX_HINT =
-  '[runway] The sandbox blocked part of this command. Most work never needs more; first look for a way inside the project ' +
-  '(project-local paths, allowed package registries). If the task truly needs this, re-run the command with ' +
-  '"escalate": true and a one-sentence "justification"; it will be reviewed.'
+  'Check for partially completed effects before retrying. Prefer "access" for specific extra write folders or hosts. ' +
+  'If the operation requires access the sandbox cannot provide (such as direct UDP networking), request ' +
+  '"escalate": true with a one-sentence "justification"; it will be reviewed outside the sandbox. ' +
+  'For a workflow that repeatedly needs this, the user can choose /runway sandbox off for this session; review stays on.'
+
+/** An OS permission error alone does not prove the sandbox caused it. Never retry automatically. */
+export function permissionFailureHint(stderr: string, violations: readonly string[]): string | undefined {
+  if (violations.length) return `[runway] The sandbox blocked part of this command. ${SANDBOX_HINT}`
+  if (/Operation not permitted|Permission denied|\bEPERM\b|\bEACCES\b/i.test(stderr)) {
+    return `[runway] Permission failure while sandboxed; the cause may be the sandbox or ordinary OS permissions. ${SANDBOX_HINT}`
+  }
+  return undefined
+}
 
 function killTree(pid: number | undefined): void {
   if (!pid) return
@@ -164,8 +174,10 @@ export function sandboxedOperations(
           // Lines without a target (e.g. a bare "network-outbound") are background noise, not the cause.
           const violations = extra.split('\n').filter(line => VIOLATION_LINE.test(line) && !/network-outbound\s*$/.test(line))
           if (violations.length > 0) {
-            onData(Buffer.from(`\n<sandbox_violations>\n${violations.slice(0, 20).join('\n')}\n</sandbox_violations>\n${SANDBOX_HINT}\n`))
+            onData(Buffer.from(`\n<sandbox_violations>\n${violations.slice(0, 20).join('\n')}\n</sandbox_violations>\n`))
           }
+          const hint = permissionFailureHint(text, violations)
+          if (hint) onData(Buffer.from(`\n${hint}\n`))
         }
         return result
       } finally {

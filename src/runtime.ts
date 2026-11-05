@@ -68,6 +68,18 @@ export class Runtime {
 
   /** Session-level override set with /runway or the shortcut; undefined = use config/default. */
   modeOverride: Mode | undefined
+  /** Explicit startup flag only; configuration never silently disables containment. */
+  sandboxDefaultEnabled = true
+  /** Session overrides, inherited by descendants, never unrelated sessions. No settings are written. */
+  readonly sandboxOverrides = new Map<string, boolean>()
+
+  sandboxEnabled(sessionId: string): boolean {
+    for (const id of this.grants.lineage(sessionId)) {
+      const override = this.sandboxOverrides.get(id)
+      if (override !== undefined) return override
+    }
+    return this.sandboxDefaultEnabled
+  }
   config: RunwayConfig | undefined
   configProblems: string[] = []
   agentDir = ''
@@ -126,7 +138,8 @@ export class Runtime {
   /**
    * Start the sandbox once per process. The network proxy and its ask
    * callback are process-global in sandbox-runtime, so the first session's
-   * network mode wins until the mode changes (then we restart it).
+   * network mode wins. A sandbox-off session bypasses wrapping, not the proxy
+   * lifecycle: already-running contained commands remain contained.
    */
   async ensureSandbox(config: RunwayConfig, policy: Policy): Promise<void> {
     if (process.platform !== 'darwin' && process.platform !== 'linux') {

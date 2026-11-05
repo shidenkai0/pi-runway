@@ -129,13 +129,25 @@ Switch any companion off with `"companions": { "web": false }`.
 
 | | |
 |---|---|
-| Status line | `runway · auto` (Jev reviews), `runway · ask` (you review), `runway · off` |
+| Status line | `runway · auto` (Jev reviews), `runway · ask` (you review); an explicit sandbox-off session stays marked `sandbox off · reviewed` |
 | `ctrl+shift+a` | switch between auto and ask |
 | `/runway` | mode, sandbox, recent decisions, and how many approval prompts this session and its subagents showed you, per 100 command requests |
 | `/runway permissions` | rules and approvals: inspect, add, remove, revoke, reset |
 | `/runway log` | the decisions that needed one, who decided and why |
 | `/runway doctor` | check the setup: sandbox, bash ownership, reviewer key, companions, conflicting packages |
+| `/runway sandbox off` / `on` | turn command isolation off or on for this session and its subagents; **rules and review stay on** (off asks first) |
+| `pi --no-sandbox` | start without command isolation, without disabling rules or review; `/runway sandbox on` can restore it |
 | `/runway off` | no sandbox and no gate until you turn it back on (asks first) |
+
+### When the sandbox gets in the way
+
+Prefer extra access for one command. The agent can request named folders or hosts with `access`, or `escalate: true` for an operation the sandbox cannot support. Both go through review. Permission failures explain these options; the agent should check for partially completed effects before retrying, not blindly repeat a compound command.
+
+Some workflows need direct networking rather than the sandbox's HTTP/SOCKS proxy: UDP-based testing, for example. Use `/runway sandbox off` when that applies throughout a session. Commands then have your filesystem and network access, while every tool call still passes the gate and Jev sees that commands run **outside** the sandbox. Secret environment variables remain scrubbed unless you approve the exact call yourself or list them in `keepEnv`. This is less protection, not a different kind of sandbox.
+
+For an authorized security assessment, describe the scope in chat: which assets are covered, whether discovered hosts belonging to those assets may be probed, and which actions are excluded. The agent needn't ask merely because a hostname is new; Jev reviews the actual operation against the conversation. Discovery alone is not authorization—third-party infrastructure can appear in results too. The reviewer can make mistakes: with the sandbox off, there is no OS-enforced target boundary.
+
+The session control writes no settings. Subagents inherit it, unrelated new sessions do not; the startup flag applies to sessions in that Pi process. Changes affect **future** commands only: switching it back on cannot contain a command already running outside it. Existing approvals and ordinary allow rules never silently change from sandboxed to unsandboxed access.
 
 ## Settings
 
@@ -159,7 +171,7 @@ Everything works without a settings file. `~/.pi/agent/runway.json`:
 Runway keeps a confused or manipulated agent from quietly doing lasting damage. It is not a virtual machine.
 
 **Covered**
-- Every command runs under Seatbelt (macOS) or bubblewrap (Linux), whatever was approved.
+- Ordinary commands run under Seatbelt (macOS) or bubblewrap (Linux); running outside it is an explicit per-command or session choice.
 - Every tool call — including MCP, codemode-nested and subagent calls — is decided by the gate; tools nobody identified are reviewed, not trusted by name.
 - Approved arguments are frozen: a later extension can't change what runs.
 - Pi's optional `grep`, `find` and `ls` (off unless you enable them) never show lines from secrets files (`.env`, keys, `auth.json`…) or anything inside a credential store; ordinary code search works as usual.
@@ -167,7 +179,7 @@ Runway keeps a confused or manipulated agent from quietly doing lasting damage. 
 
 **Not covered**
 - **Tools that run inside Pi** (MCP servers, web fetch, other extensions' tools) are gated but not sandboxed: once allowed, they act with your access.
-- **`escalate`d commands** run with your full user access. Secret environment variables are removed unless you approved the call yourself.
+- **`escalate`d commands and sandbox-off sessions** run with your full user access. Secret environment variables are removed unless you approved the exact call yourself or listed them in `keepEnv`.
 - **Your project** is readable and writable, including any credentials stored in it.
 - **The reviewer makes mistakes** (see the table). The sandbox limits what a wrong approval to an ordinary command can do.
 - **Codemode scripts** can call models with your provider credentials directly; that part isn't checked call by call (the script itself is reviewed).

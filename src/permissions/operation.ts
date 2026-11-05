@@ -130,6 +130,8 @@ export interface NormalizeArgs {
   toolCallId: string
   parentToolCallId?: string
   meta: ToolMeta
+  /** Trusted session control; only affects Runway's own bash. Not an agent argument. */
+  sandboxDisabled?: boolean
 }
 
 function buildOp(a: NormalizeArgs): Omit<Operation, 'key' | 'endpoints'> & { key?: string; endpoints?: Endpoint[] } {
@@ -150,7 +152,7 @@ function buildOp(a: NormalizeArgs): Omit<Operation, 'key' | 'endpoints'> & { key
       hosts: Array.isArray(raw.hosts) ? raw.hosts.filter((h): h is string => typeof h === 'string').map(h => h.toLowerCase()) : [],
     }
     for (const h of access.hosts) hosts.add(h)
-    const escalate = input.escalate === true
+    const escalate = input.escalate === true || a.sandboxDisabled === true
     const endpoints = [...endpointsIn(command), ...access.hosts.map(h => parseHostPort(h))]
     const execution: Execution = escalate ? 'unsandboxed' : access.write.length || access.hosts.length ? 'sandboxed-with-access' : 'sandboxed'
     const extra = access.write.length > 0 || access.hosts.length > 0
