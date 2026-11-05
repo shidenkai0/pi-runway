@@ -1,7 +1,7 @@
 {
   "name": "pi-runway",
   "version": "0.1.0",
-  "description": "Autonomous coding in Pi with mistakes contained: an OS sandbox for every command, one permission gate for every tool call, Jev review for anything your rules don't decide \u2014 plus subagents, plan mode and web tools in one install.",
+  "description": "Autonomous coding in Pi with mistakes contained: an OS sandbox for every command, one permission gate for every tool call, Jev review for anything your rules don't decide — plus subagents, plan mode and web tools in one install.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -39,10 +39,10 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "0.0.77",
-    "@gotgenes/pi-subagents": "21.9.1",
-    "@narumitw/pi-plan-mode": "0.58.4",
-    "pi-web-access": "0.35.0"
+    "@anthropic-ai/sandbox-runtime": "0.0.81",
+    "@gotgenes/pi-subagents": "25.0.5",
+    "@narumitw/pi-plan-mode": "0.59.4",
+    "pi-web-access": "0.46.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -51,10 +51,10 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.5.0",
     "@types/node": "^24.10.1",
     "typescript": "^5.9.3",
-    "@earendil-works/pi-tui": "1.0.0"
+    "@earendil-works/pi-tui": "1.5.0"
   },
   "bundleDependencies": [
     "@gotgenes/pi-subagents",

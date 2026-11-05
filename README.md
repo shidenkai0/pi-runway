@@ -196,7 +196,7 @@ Runway keeps a confused or manipulated agent from quietly doing lasting damage. 
 
 ## Updating
 
-`pi update --extensions`. Runway doesn't pin Pi: it uses Pi's public extension API and declares Pi's packages as peer dependencies. Tested with Pi 1.0.0 on macOS and Linux.
+`pi update --extensions`. Runway doesn't pin Pi: it uses Pi's public extension API and declares Pi's packages as peer dependencies. Tested with Pi 1.0.0 on macOS and Linux, and Pi 1.5.0 on macOS.
 
 ## Development
 
