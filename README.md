@@ -11,13 +11,23 @@ It does two independent things:
 
 You keep your models, providers, logins and other packages. Runway also bundles subagents (each with its own model), plan mode and web search, so it's one install.
 
-> **Status: prototype, not published yet.** Try it locally with the steps below. Once published: `pi install npm:pi-runway`.
+> **Status: early release (0.x).** Behaviour and settings may still change between minor versions.
 
-## Try it
+## Install
 
-You need macOS or Linux, Node 22.19 or newer, and Pi 1.0.
+You need macOS or Linux, Node 22.19 or newer, and Pi 1.0 or newer.
 
 On Linux, also install `bubblewrap`, `socat` and `ripgrep` (Debian/Ubuntu: `sudo apt-get install bubblewrap socat ripgrep`). `/runway doctor` reports missing dependencies; if your system disallows unprivileged user namespaces, the sandbox stays off and commands are blocked rather than silently running unprotected.
+
+```bash
+pi install npm:@shidenkai0/pi-runway
+```
+
+Then start Pi and run `/runway doctor`. For automatic reviews, set `OPENROUTER_API_KEY` or `/login` to OpenRouter; without a key, you review instead of Jev.
+
+### Try it without touching your Pi setup
+
+From a checkout of this repository:
 
 ```bash
 npm install
@@ -26,7 +36,7 @@ scripts/try-local.sh              # or: scripts/try-local.sh <new-or-empty-folde
 
 The script creates `../runway-trial` with its own Pi settings folder (whose only package is this checkout) and a scratch git project, then prints the command to start Pi there. Your normal Pi setup is not loaded or changed. It refuses folders that aren't new, empty, or an earlier trial.
 
-In the trial: `/login` to a model provider, then `/runway doctor`. For automatic reviews, set `OPENROUTER_API_KEY` or `/login` to OpenRouter; without a key, you review instead of Jev.
+In the trial: `/login` to a model provider, then `/runway doctor`.
 
 ## What happens when the agent…
 

@@ -6,15 +6,16 @@ import { after, before, test } from 'node:test'
 import { makeHome, PI_BIN, READ_BLOCKED, runRpc, SECRET_CANARY, sequence, startFakeServer } from '../support/harness.ts'
 import type { FakeServer, PiEvent } from '../support/harness.ts'
 
-// The package as users get it: `pi install npm:pi-runway` from a registry,
+// The package as users get it: `pi install npm:@shidenkai0/pi-runway` from a registry,
 // used, then `pi update --extensions` to a newer version.
 //
 // Needs a throwaway registry on this machine that already serves the packed
 // version (npm pack; npm publish <tgz> --registry <local>), plus a second,
 // newer tarball this test publishes there mid-run:
-//   RUNWAY_TEST_REGISTRY=http://127.0.0.1:4873/ RUNWAY_NEXT_TGZ=/abs/pi-runway-0.1.1.tgz
+//   RUNWAY_TEST_REGISTRY=http://127.0.0.1:4873/ RUNWAY_NEXT_TGZ=/abs/shidenkai0-pi-runway-0.1.1.tgz
 // The registry must be on localhost: this test never publishes anywhere else.
 
+const PKG = '@shidenkai0/pi-runway'
 const REGISTRY = process.env.RUNWAY_TEST_REGISTRY
 const NEXT = process.env.RUNWAY_NEXT_TGZ
 const local = REGISTRY ? /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\/$/.test(REGISTRY) : false
@@ -28,7 +29,7 @@ after(async () => {
 })
 
 const notices = (events: PiEvent[]) => events.filter(e => e.type === 'extension_ui_request' && e.method === 'notify').map(e => String(e.message))
-const installedVersion = (agentDir: string) => (JSON.parse(readFileSync(join(agentDir, 'npm', 'node_modules', 'pi-runway', 'package.json'), 'utf8')) as { version: string }).version
+const installedVersion = (agentDir: string) => (JSON.parse(readFileSync(join(agentDir, 'npm', 'node_modules', PKG, 'package.json'), 'utf8')) as { version: string }).version
 
 test('published package: pi install, doctor, contained work, pi update to a newer version', { skip: !(local && NEXT) && 'set RUNWAY_TEST_REGISTRY (localhost) and RUNWAY_NEXT_TGZ', timeout: 900_000 }, async () => {
   const h = makeHome(server)
@@ -42,9 +43,9 @@ test('published package: pi install, doctor, contained work, pi update to a newe
     const env = { ...h.env, PI_OFFLINE: undefined, npm_config_registry: REGISTRY, npm_config_cache: join(h.root, 'npm-cache'), npm_config_prefer_online: 'true' }
     const run = (bin: string, args: string[]) => execFileSync(bin, args, { cwd: h.project, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000 })
 
-    assert.match(run(PI_BIN, ['install', 'npm:pi-runway']), /Installed/)
+    assert.match(run(PI_BIN, ['install', `npm:${PKG}`]), /Installed/)
     const first = installedVersion(h.agentDir)
-    const installed = join(h.agentDir, 'npm', 'node_modules', 'pi-runway')
+    const installed = join(h.agentDir, 'npm', 'node_modules', PKG)
     for (const dep of ['@gotgenes/pi-subagents', '@narumitw/pi-plan-mode', 'pi-web-access']) {
       assert.ok(existsSync(join(installed, 'node_modules', dep, 'package.json')), `${dep} came with the package`)
     }

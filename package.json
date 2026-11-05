@@ -1,9 +1,17 @@
 {
-  "name": "pi-runway",
+  "name": "@shidenkai0/pi-runway",
   "version": "0.1.0",
   "description": "Autonomous coding in Pi with mistakes contained: an OS sandbox for every command, one permission gate for every tool call, Jev review for anything your rules don't decide — plus subagents, plan mode and web tools in one install.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shidenkai0/pi-runway.git"
+  },
+  "homepage": "https://github.com/shidenkai0/pi-runway#readme",
+  "bugs": {
+    "url": "https://github.com/shidenkai0/pi-runway/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -29,6 +37,9 @@
   },
   "engines": {
     "node": ">=22.19"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "node --test --test-concurrency=4 test/unit/*.test.ts",
