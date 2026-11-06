@@ -3,3 +3,4 @@ node_modules/
 .e2e/
 .pnpm-store/
 deno.lock
+eval/private/

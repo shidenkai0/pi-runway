@@ -16,6 +16,10 @@
 // <dir> is the pi-auto-review-jev `eval` folder holding the owner's private
 // `local/legacy-131.jsonl` (verified against its SHA-256) and the owner set
 // `research/eval_set_owner.jsonl`. They are read in place and never copied.
+// The owner's notes on some historical cases describe those private sessions,
+// so they live in eval/private/historical-reasons.json (gitignored), not in
+// the manifest; eval/cases.json pins the historical labels' hash with and
+// without them.
 //
 // The cases are historical permission requests replayed through today's gate,
 // not executions: no working folder or full tool arguments were recorded, so
@@ -57,7 +61,7 @@ interface PublicCase {
   call: { tool: 'bash' | 'read' | 'write' | 'edit'; input: Record<string, unknown> }
   transcript: { source: 'user' | 'user_interaction' | 'assistant' | 'tool'; content: string; label?: string }[]
 }
-interface Suite { revision: number; privateCorpusSha256: string; policyBasis: string[]; cases: Case[]; publicCases?: PublicCase[] }
+interface Suite { revision: number; privateCorpusSha256: string; historicalSha256: { withReasons: string; withoutReasons: string }; policyBasis: string[]; cases: Case[]; publicCases?: PublicCase[] }
 export type Selection = 'historical' | 'public'
 
 type ReviewerResult =
@@ -100,7 +104,7 @@ const PUBLIC_ID = /^P\d{2}$/
 
 export function validateSuite(value: unknown): Suite {
   const s = value as Suite
-  if (!s || s.revision !== 3 || !HEX64.test(s.privateCorpusSha256) || !Array.isArray(s.policyBasis) || !Array.isArray(s.cases)) throw new Error('eval/cases.json: unexpected shape')
+  if (!s || s.revision !== 3 || !HEX64.test(s.privateCorpusSha256) || !HEX64.test(s.historicalSha256?.withReasons) || !HEX64.test(s.historicalSha256?.withoutReasons) || !Array.isArray(s.policyBasis) || !Array.isArray(s.cases)) throw new Error('eval/cases.json: unexpected shape')
   const ids = new Set<string>()
   const overlaps = new Set<string>()
   for (const c of s.cases) {
@@ -130,8 +134,25 @@ export function validateSuite(value: unknown): Suite {
 }
 
 const suite = validateSuite(JSON.parse(readFileSync(join(here, 'cases.json'), 'utf8')))
-/** The historical part of the manifest, exactly as it was hashed before public cases were added. */
-const historicalText = `${JSON.stringify({ revision: suite.revision, privateCorpusSha256: suite.privateCorpusSha256, policyBasis: suite.policyBasis, cases: suite.cases }, null, 2)}\n`
+const historicalText = (cases: Case[]) => `${JSON.stringify({ revision: suite.revision, privateCorpusSha256: suite.privateCorpusSha256, policyBasis: suite.policyBasis, cases }, null, 2)}\n`
+/**
+ * The historical part of the manifest, hashed as it was before public cases
+ * were added: with the owner's private notes. Unchanged labels keep that hash;
+ * edited labels get a new one. A private notes file that exists must match.
+ */
+function historicalLabelsHash(): string {
+  const { withReasons, withoutReasons } = suite.historicalSha256
+  const notes = join(here, 'private', 'historical-reasons.json')
+  if (existsSync(notes)) {
+    const reasons = JSON.parse(readFileSync(notes, 'utf8')) as Record<string, string>
+    const full = sha256(historicalText(suite.cases.map(c => (reasons[c.id] ? { ...c, reason: reasons[c.id] } : c))))
+    if (full !== withReasons && sha256(historicalText(suite.cases)) === withoutReasons) throw new Error('eval/private/historical-reasons.json does not match eval/cases.json')
+    return full
+  }
+  const bare = sha256(historicalText(suite.cases))
+  return bare === withoutReasons ? withReasons : bare
+}
+const historicalLabels = historicalLabelsHash()
 const publicCases = suite.publicCases ?? []
 const labels = new Map(suite.cases.map(c => [c.id, c.expected]))
 const publicLabels = new Map(publicCases.map(c => [c.id, c.expected]))
@@ -240,7 +261,7 @@ export function fingerprintParts(config: RunwayConfig, inputs: Record<string, st
     gateConfig: sha256(JSON.stringify({ ...config, reviewer: undefined })),
     code: sha256(FINGERPRINTED_SOURCES.map(f => `${f}\n${sha256(readFileSync(join(repo, f)))}`).join('\n')),
     // Public cases carry their inputs, so their hash covers labels and inputs alike.
-    labels: sha256(selection === 'public' ? JSON.stringify(publicCases) : historicalText),
+    labels: selection === 'public' ? sha256(JSON.stringify(publicCases)) : historicalLabels,
     ...inputs,
   }
 }

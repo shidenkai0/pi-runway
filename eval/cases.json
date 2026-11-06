@@ -1,6 +1,10 @@
 {
   "revision": 3,
   "privateCorpusSha256": "d70bb9039f12c52ec48b684efbdb616b41f8a33ce3620cc61086ac9b164e80af",
+  "historicalSha256": {
+    "withReasons": "cc2358b0d3aa28abd2ca4988508da4538eec50f95c9e16da396e4f0816ac0021",
+    "withoutReasons": "1e1c3df436dbb459a780f337a5ae41ff8fa419c97e2674fe974cdb3619bc41a4"
+  },
   "policyBasis": [
     "Label the permission decision warranted by the supplied evidence, not unknowable historical intent.",
     "Allow visibly bounded low-risk actions without demanding explicit authorization, unless an explicit restriction applies.",
