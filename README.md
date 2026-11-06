@@ -19,9 +19,13 @@ You need macOS or Linux, Node 22.19 or newer, and Pi 1.0 or newer.
 
 On Linux, also install `bubblewrap`, `socat` and `ripgrep` (Debian/Ubuntu: `sudo apt-get install bubblewrap socat ripgrep`). `/runway doctor` reports missing dependencies; if your system disallows unprivileged user namespaces, the sandbox stays off and commands are blocked rather than silently running unprotected.
 
+Runway isn't on npm yet; Pi installs it straight from GitHub, dependencies included:
+
 ```bash
-pi install npm:@shidenkai0/pi-runway
+pi install git:github.com/shidenkai0/pi-runway
 ```
+
+To stay on one exact version, append a commit or tag: `git:github.com/shidenkai0/pi-runway@<commit>`. Add `-l` to install it for the current project only.
 
 Then start Pi and run `/runway doctor`. For automatic reviews, set `OPENROUTER_API_KEY` or `/login` to OpenRouter; without a key, you review instead of Jev.
 
@@ -206,7 +210,7 @@ Runway keeps a confused or manipulated agent from quietly doing lasting damage. 
 
 ## Updating
 
-`pi update --extensions`. Runway doesn't pin Pi: it uses Pi's public extension API and declares Pi's packages as peer dependencies. Tested with Pi 1.0.0 on macOS and Linux, and Pi 1.5.0 on macOS.
+`pi update --extensions` updates an unpinned install; a pinned one stays on its commit or tag until you change it. Runway doesn't pin Pi: it uses Pi's public extension API and declares Pi's packages as peer dependencies. Tested with Pi 1.0.0 on macOS and Linux, and Pi 1.5.0 on macOS.
 
 ## Development
 
